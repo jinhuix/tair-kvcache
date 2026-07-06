@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/optimizer/config/types.h"
@@ -48,7 +49,30 @@ struct TtlParams : public Jsonizable {
     }
 };
 
-using EvictionPolicyParam = std::variant<LruParams, RandomLruParams, TtlParams>;
+struct PromoteLruParams : public Jsonizable {
+    double sample_rate = 0.0;
+    int32_t shard_count = 1024;
+    int32_t sample_times = 32;
+    double eviction_amplification_factor = 1.0;
+    std::vector<std::string> enabled_tiers;
+    bool FromRapidValue(const rapidjson::Value &v) override {
+        KVCM_JSON_GET_MACRO(v, "sample_rate", sample_rate);
+        KVCM_JSON_GET_MACRO(v, "shard_count", shard_count);
+        KVCM_JSON_GET_MACRO(v, "sample_times", sample_times);
+        KVCM_JSON_GET_MACRO(v, "eviction_amplification_factor", eviction_amplification_factor);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "enabled_tiers", enabled_tiers, std::vector<std::string>{});
+        return true;
+    }
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "sample_rate", sample_rate);
+        Put(writer, "shard_count", shard_count);
+        Put(writer, "sample_times", sample_times);
+        Put(writer, "eviction_amplification_factor", eviction_amplification_factor);
+        Put(writer, "enabled_tiers", enabled_tiers);
+    }
+};
+
+using EvictionPolicyParam = std::variant<LruParams, RandomLruParams, TtlParams, PromoteLruParams>;
 
 class EvictionConfig : public Jsonizable {
 public:

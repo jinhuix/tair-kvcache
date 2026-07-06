@@ -48,6 +48,17 @@ std::shared_ptr<EvictionPolicy> EvictionPolicyFactory::CreatePolicy(EvictionPoli
             "Creating TTL policy for tier %s, fallback_on_pressure=%d", name.c_str(), ttl_params.fallback_on_pressure);
         return std::make_shared<TtlEvictionPolicy>(name, ttl_params.fallback_on_pressure);
     }
+    case EvictionPolicyType::POLICY_PROMOTE_LRU: {
+        if (!std::holds_alternative<PromoteLruParams>(param)) {
+            KVCM_LOG_ERROR("Invalid parameters for Promote LRU eviction policy on tier %s", name.c_str());
+            return nullptr;
+        }
+        const PromoteLruParams &promote_lru_params = std::get<PromoteLruParams>(param);
+        KVCM_LOG_INFO("Creating Promote LRU policy for tier %s, enabled_tiers_count=%zu",
+                      name.c_str(),
+                      promote_lru_params.enabled_tiers.size());
+        return std::make_shared<PromoteLruEvictionPolicy>(name, promote_lru_params);
+    }
     case EvictionPolicyType::POLICY_UNSPECIFIED:
     default:
         KVCM_LOG_ERROR("Unsupported eviction policy type for tier %s", name.c_str());

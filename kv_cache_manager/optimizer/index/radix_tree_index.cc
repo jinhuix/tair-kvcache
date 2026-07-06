@@ -415,7 +415,7 @@ void RadixTreeIndex::TouchKeysAtTier(const std::vector<int64_t> &block_keys,
         }
         block->access_count += 1;
         block->last_access_time = timestamp;
-        TouchTierLocation(block, tier_idx, timestamp, refresh_ttl_on_read, false, true);
+        TouchTierLocation(block, tier_idx, timestamp, refresh_ttl_on_read, false, true, true);
         current_tier_flow_.RecordReadTouch(instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
     }
 }
@@ -750,7 +750,7 @@ void RadixTreeIndex::TouchExistingTierOnWrite(BlockEntry *block,
         return;
     }
 
-    TouchTierLocation(block, tier_idx, timestamp, false, false, false);
+    TouchTierLocation(block, tier_idx, timestamp, false, false, false, false);
     const auto reason = count_write_touch ? TierFlowEventReason::WRITE : TierFlowEventReason::WRITE_PROPAGATION;
     current_tier_flow_.RecordWriteTouch(instance_id_, block, tier_names_[tier_idx], reason, timestamp);
     if (count_write_touch) {
@@ -764,7 +764,8 @@ void RadixTreeIndex::TouchTierLocation(BlockEntry *block,
                                        int64_t timestamp,
                                        bool refresh_ttl_on_read,
                                        bool update_writing_time,
-                                       bool increase_access_count) {
+                                       bool increase_access_count,
+                                       bool read_access) {
     if (block == nullptr || tier_idx >= tier_policies_.size() || tier_idx >= tier_names_.size()) {
         return;
     }
@@ -779,7 +780,11 @@ void RadixTreeIndex::TouchTierLocation(BlockEntry *block,
     if (increase_access_count) {
         loc_it->second.access_count += 1;
     }
-    tier_policies_[tier_idx]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+    if (read_access) {
+        tier_policies_[tier_idx]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+    } else {
+        tier_policies_[tier_idx]->OnBlockTouched(block, timestamp);
+    }
 }
 
 bool RadixTreeIndex::ShouldPropagateReadAcrossEdge(size_t edge_idx) const {
@@ -827,12 +832,12 @@ void RadixTreeIndex::TouchBlockLocations(BlockEntry *block,
         auto loc_it = block->location_map.find(tier_name);
         if (loc_it != block->location_map.end()) {
             if (first_hit) {
-                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, count_read);
+                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, count_read, count_read);
                 current_tier_flow_.RecordReadTouch(
                     instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
                 first_hit = false;
             } else if (propagate_access) {
-                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, false);
+                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, false, count_read);
                 current_tier_flow_.RecordReadTouch(
                     instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
             }

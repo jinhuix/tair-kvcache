@@ -6,6 +6,7 @@
 #include "kv_cache_manager/optimizer/eviction_policy/base.h"
 #include "kv_cache_manager/optimizer/eviction_policy/leaf_aware_lru.h"
 #include "kv_cache_manager/optimizer/eviction_policy/lru.h"
+#include "kv_cache_manager/optimizer/eviction_policy/promote_lru.h"
 #include "kv_cache_manager/optimizer/eviction_policy/random_lru.h"
 #include "kv_cache_manager/optimizer/eviction_policy/ttl.h"
 namespace kv_cache_manager {

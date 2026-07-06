@@ -341,6 +341,52 @@ TEST_F(OptimizerManagerTest, MambaStateResidentCheckpointsUseLruEviction) {
     EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
 }
 
+TEST_F(OptimizerManagerTest, PromoteLruKeepsMambaHitPrefixUnderSharedCapacityPressure) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_chunk_size_blocks(2);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(4);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    PromoteLruParams promote_lru_params;
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_PROMOTE_LRU);
+    instances[0].set_eviction_policy_param(promote_lru_params);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> hot_prefix = {1, 2};
+    manager.WriteCache("instance1", "write_hot", 1000, hot_prefix);
+
+    BlockMask hot_mask = std::vector<bool>{false, false};
+    auto hot_hit = manager.GetCacheLocation("instance1", "read_hot", 2000, hot_prefix, hot_mask, 2);
+    EXPECT_EQ(hot_hit.kvcm_hit_length, 2);
+
+    manager.WriteCache("instance1", "write_cold", 3000, {10, 11});
+
+    auto hot_after_pressure =
+        manager.GetCacheLocation("instance1", "read_hot_after_pressure", 4000, hot_prefix, hot_mask, 2);
+    EXPECT_EQ(hot_after_pressure.kvcm_hit_length, 2);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->mamba_state_candidate_blocks, 2);
+    EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
+}
+
 TEST_F(OptimizerManagerTest, ReadRejectsPartialTailBlockKeys) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());

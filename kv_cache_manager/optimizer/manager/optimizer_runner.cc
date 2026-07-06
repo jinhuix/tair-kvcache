@@ -165,17 +165,12 @@ void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
     ValidateSupportedQueryTypeOrThrow(trace.query_type());
     ReadRecord read_record = HandleGetLocation(trace);
     stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
-    const size_t raw_full_hit_blocks = mamba_state_config_.enabled()
-                                           ? read_record.mamba_state_candidate_blocks
-                                           : read_record.remote_hit_blocks + read_record.local_hit_blocks;
     const size_t mamba_hit_blocks =
-        mamba_state_config_.enabled() ? read_record.mamba_state_hit_blocks : raw_full_hit_blocks;
-    ScheduleRequestWrite(trace, raw_full_hit_blocks, mamba_hit_blocks);
+        mamba_state_config_.enabled() ? read_record.mamba_state_hit_blocks : 0;
+    ScheduleRequestWrite(trace, mamba_hit_blocks);
 }
 
-void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace,
-                                           size_t full_hit_blocks,
-                                           size_t mamba_hit_blocks) {
+void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t mamba_hit_blocks) {
     if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
         throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
                                  ", trace_id=" + trace.trace_id());
@@ -188,7 +183,7 @@ void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace,
     write_trace.set_keys(trace.keys());
     write_trace.set_ttl_us(trace.ttl_us());
     pending_writes_.push(PendingWrite{
-        write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace), full_hit_blocks, mamba_hit_blocks});
+        write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace), mamba_hit_blocks});
 }
 
 void OptimizerRunner::FlushPendingWritesThrough(int64_t timestamp_ns) {
@@ -208,7 +203,7 @@ void OptimizerRunner::FlushAllPendingWrites() {
 }
 
 void OptimizerRunner::RunPendingWrite(const PendingWrite &pending) {
-    HandleCacheInsert(pending.trace, true, nullptr, pending.full_hit_blocks, pending.mamba_hit_blocks);
+    HandleCacheInsert(pending.trace, true, nullptr, pending.mamba_hit_blocks);
     stats_collector_->UpdateTimestamp(pending.trace.instance_id(), pending.trace.timestamp_ns());
 }
 
@@ -735,7 +730,6 @@ size_t OptimizerRunner::EvictMambaStateIfNeeded(const std::string &instance_id) 
 WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trace,
                                                bool count_new_tier_write_touch,
                                                const std::vector<size_t> *materialized_indices,
-                                               size_t full_hit_blocks,
                                                size_t mamba_hit_blocks) {
     WriteRecord record;
     record.timestamp_ns = trace.timestamp_ns();
@@ -759,7 +753,7 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
     std::vector<size_t> mamba_checkpoint_admission_indices;
     const std::vector<size_t> *effective_materialized_indices = materialized_indices;
     if (count_new_tier_write_touch && materialized_indices == nullptr && mamba_state_config_.enabled()) {
-        const size_t first_materialized_block = full_hit_blocks;
+        const size_t first_materialized_block = mamba_hit_blocks;
         for (size_t idx = first_materialized_block; idx < trace.keys().size(); ++idx) {
             mamba_checkpoint_admission_indices.push_back(idx);
         }

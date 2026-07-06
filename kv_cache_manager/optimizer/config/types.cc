@@ -10,6 +10,8 @@ EvictionPolicyType ToEvictionPolicyType(const std::string &str) {
         return EvictionPolicyType::POLICY_LEAF_AWARE_LRU;
     } else if (str == "ttl") {
         return EvictionPolicyType::POLICY_TTL;
+    } else if (str == "promote_lru") {
+        return EvictionPolicyType::POLICY_PROMOTE_LRU;
     } else {
         return EvictionPolicyType::POLICY_UNSPECIFIED;
     }
@@ -24,6 +26,8 @@ std::string ToString(const EvictionPolicyType &type) {
         return "leaf_aware_lru";
     case EvictionPolicyType::POLICY_TTL:
         return "ttl";
+    case EvictionPolicyType::POLICY_PROMOTE_LRU:
+        return "promote_lru";
     default:
         return "unspecified";
     }

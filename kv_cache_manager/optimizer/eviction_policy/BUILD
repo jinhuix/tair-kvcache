@@ -4,6 +4,7 @@ cc_library(
     name = "eviction_policy",
     srcs = [
         "lru.cc",
+        "promote_lru.cc",
         "random_lru.cc",
         "leaf_aware_lru.cc",
         "ttl.cc",
@@ -14,6 +15,7 @@ cc_library(
         "common_structure.h",
         "policy_factory.h",
         "lru.h",
+        "promote_lru.h",
         "random_lru.h",
         "leaf_aware_lru.h",
         "ttl.h",

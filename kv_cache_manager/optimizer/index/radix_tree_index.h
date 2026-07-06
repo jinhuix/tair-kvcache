@@ -189,7 +189,8 @@ private:
                            int64_t timestamp,
                            bool refresh_ttl_on_read,
                            bool update_writing_time,
-                           bool increase_access_count);
+                           bool increase_access_count,
+                           bool read_access);
     bool ShouldPropagateReadAcrossEdge(size_t edge_idx) const;
     bool ShouldPropagateWriteAcrossEdge(size_t edge_idx) const;
     bool IsWriteThroughEdge(size_t edge_idx) const;

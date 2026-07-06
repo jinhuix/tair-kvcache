@@ -12,6 +12,7 @@ enum class EvictionPolicyType {
     POLICY_RANDOM_LRU = 2,
     POLICY_LEAF_AWARE_LRU = 3,
     POLICY_TTL = 4,
+    POLICY_PROMOTE_LRU = 5,
 };
 enum class EvictionMode {
     EVICTION_MODE_UNSPECIFIED = 0,

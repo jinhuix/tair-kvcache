@@ -67,7 +67,6 @@ private:
         int64_t timestamp_ns = 0;
         uint64_t sequence = 0;
         WriteCacheSchemaTrace trace;
-        size_t full_hit_blocks = 0;
         size_t mamba_hit_blocks = 0;
     };
 
@@ -94,7 +93,7 @@ private:
 
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
     void HandleRequest(const RequestSchemaTrace &trace);
-    void ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t full_hit_blocks, size_t mamba_hit_blocks);
+    void ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t mamba_hit_blocks);
     void FlushPendingWritesThrough(int64_t timestamp_ns);
     void FlushAllPendingWrites();
     void RunPendingWrite(const PendingWrite &pending);
@@ -134,7 +133,6 @@ private:
     WriteRecord HandleCacheInsert(const WriteCacheSchemaTrace &trace,
                                   bool count_new_tier_write_touch,
                                   const std::vector<size_t> *materialized_indices,
-                                  size_t full_hit_blocks = 0,
                                   size_t mamba_hit_blocks = 0);
     ReadRecord SubmitReadRecord(const std::string &instance_id,
                                 const std::string &trace_id,

@@ -22,6 +22,10 @@ struct ReadRecord {
     size_t remote_hit_blocks;
     size_t local_read_blocks;
     size_t local_hit_blocks;
+    std::vector<size_t> local_hit_indices;
+    std::vector<size_t> remote_hit_indices;
+    size_t mamba_state_candidate_blocks = 0;
+    size_t mamba_state_hit_blocks = 0;
     size_t current_cache_blocks;
     size_t input_tokens = 0;
     size_t block_size_tokens = 0;

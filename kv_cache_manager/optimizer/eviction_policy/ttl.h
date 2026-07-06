@@ -25,6 +25,7 @@ public:
     void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     std::vector<BlockEntry *> EvictExpired() override;
+    bool RemoveBlock(BlockEntry *block) override;
     void Clear() override;
     bool NeedCapacityEviction() const override { return fallback_on_pressure_; }
     void AdvanceClock(int64_t timestamp) override;

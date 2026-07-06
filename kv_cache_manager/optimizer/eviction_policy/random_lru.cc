@@ -79,19 +79,21 @@ std::vector<BlockEntry *> RandomLruEvictionPolicy::SampleAndPickLru(size_t sampl
 
     return result;
 }
-void RandomLruEvictionPolicy::RemoveBlock(BlockEntry *block) {
+bool RandomLruEvictionPolicy::RemoveBlock(BlockEntry *block) {
     auto it = block_to_index_.find(block);
-    if (it != block_to_index_.end()) {
-        size_t index = it->second;
-        BlockEntry *last_block = blocks_.back();
-        blocks_[index] = last_block;
-        timestamps_[index] = timestamps_.back();
-        block_to_index_[last_block] = index;
-        blocks_.pop_back();
-        timestamps_.pop_back();
-        block_to_index_.erase(it);
-        ClearBlockLocation(block);
+    if (it == block_to_index_.end()) {
+        return false;
     }
+    size_t index = it->second;
+    BlockEntry *last_block = blocks_.back();
+    blocks_[index] = last_block;
+    timestamps_[index] = timestamps_.back();
+    block_to_index_[last_block] = index;
+    blocks_.pop_back();
+    timestamps_.pop_back();
+    block_to_index_.erase(it);
+    ClearBlockLocation(block);
+    return true;
 }
 
 void RandomLruEvictionPolicy::Clear() {

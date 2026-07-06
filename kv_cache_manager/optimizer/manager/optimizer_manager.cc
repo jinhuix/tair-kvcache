@@ -82,10 +82,6 @@ bool OptimizerManager::Init() {
             continue;
         }
 
-        std::sort(storage_configs.begin(), storage_configs.end(), [](const OptTierConfig &a, const OptTierConfig &b) {
-            return a.priority() < b.priority();
-        });
-
         instance_group_configs_[group_name] = group;
 
         if (group.instances().empty()) {
@@ -171,7 +167,8 @@ bool OptimizerManager::Init() {
                                                 eviction_manager_,
                                                 stats_collector_,
                                                 instance_group_ttl_disabled_,
-                                                instance_ttl_refresh_on_read_));
+                                                instance_ttl_refresh_on_read_,
+                                                config_.mamba_state_config()));
     return true;
 }
 
@@ -251,7 +248,10 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                                        const int64_t timestamp,
                                                        const std::vector<int64_t> &block_ids,
                                                        const BlockMask &block_mask,
-                                                       const int64_t input_len) {
+                                                       const int64_t input_len,
+                                                       bool touch_local_hits,
+                                                       bool local_hits_are_reads,
+                                                       const std::string &query_type) {
     GetLocationSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
@@ -259,7 +259,8 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_keys(block_ids);
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
     trace.set_block_mask(block_mask);
-    optimizer_runner_->HandleGetLocation(trace);
+    trace.set_query_type(query_type);
+    optimizer_runner_->HandleGetLocation(trace, touch_local_hits, local_hits_are_reads);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     GetCacheLocationRes res;
@@ -269,6 +270,9 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
         res.kvcm_hit_length = last_read->remote_hit_blocks;
+        res.hit_indices = last_read->remote_hit_indices;
+        res.hit_indices.insert(
+            res.hit_indices.end(), last_read->local_hit_indices.begin(), last_read->local_hit_indices.end());
     }
     return res;
 }
@@ -319,7 +323,11 @@ bool OptimizerManager::ClearCache(const std::string &instance_id) {
         KVCM_LOG_ERROR("Indexer manager not initialized");
         return false;
     }
-    return indexer_manager_->ClearCache(instance_id);
+    const bool cleared = indexer_manager_->ClearCache(instance_id);
+    if (cleared && optimizer_runner_) {
+        optimizer_runner_->ClearMambaState(instance_id);
+    }
+    return cleared;
 }
 
 void OptimizerManager::ClearAllCaches() {
@@ -328,6 +336,9 @@ void OptimizerManager::ClearAllCaches() {
         return;
     }
     indexer_manager_->ClearAllCaches();
+    if (optimizer_runner_) {
+        optimizer_runner_->ClearAllMambaStates();
+    }
 }
 
 bool OptimizerManager::ClearCacheAndResetStats(const std::string &instance_id) {

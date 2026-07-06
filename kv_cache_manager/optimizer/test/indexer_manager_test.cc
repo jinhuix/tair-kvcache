@@ -193,8 +193,8 @@ TEST_F(OptIndexerManagerTest, CheckAndEvict) {
     indexer_manager_->CreateOptIndexer(instance_config, tier_configs, false);
 
     // 检查并触发驱逐，传入测试时间戳
-    auto evicted_blocks = indexer_manager_->CheckAndEvict("instance1");
-    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
+    auto eviction = indexer_manager_->CheckAndEvict("instance1");
+    indexer_manager_->CleanEvictedBlocks(eviction.evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();
@@ -257,8 +257,8 @@ TEST_F(OptIndexerManagerTest, RegisterInstanceGroupsAndInstances) {
 
 TEST_F(OptIndexerManagerTest, CheckAndEvictNonExistentInstance) {
     // 检查不存在的实例
-    auto evicted_blocks = indexer_manager_->CheckAndEvict("non_existent_instance");
-    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
+    auto eviction = indexer_manager_->CheckAndEvict("non_existent_instance");
+    indexer_manager_->CleanEvictedBlocks(eviction.evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();

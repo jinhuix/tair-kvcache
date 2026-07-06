@@ -105,9 +105,9 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::EvictExpiredBeforeAccess(con
     return eviction_manager_->ActiveEvictExpired(*group_config, current_timestamp);
 }
 
-OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::string &instance_id,
-                                                                  int64_t eviction_timestamp) {
-    EvictedBlocks empty_result;
+OptEvictionManager::EvictionResult OptIndexerManager::CheckAndEvict(const std::string &instance_id,
+                                                                    int64_t eviction_timestamp) {
+    OptEvictionManager::EvictionResult empty_result;
     const auto *group_config = FindInstanceGroupConfig(instance_id);
     if (!group_config) {
         return empty_result;

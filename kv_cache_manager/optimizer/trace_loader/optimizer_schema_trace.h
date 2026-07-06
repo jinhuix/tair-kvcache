@@ -7,6 +7,16 @@
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
+inline bool IsPrefixMatchQueryType(const std::string &query_type) {
+    return query_type.empty() || query_type == "prefix_match";
+}
+
+inline bool IsBatchGetQueryType(const std::string &query_type) { return query_type == "batch_get"; }
+
+inline bool IsSupportedQueryType(const std::string &query_type) {
+    return IsPrefixMatchQueryType(query_type) || IsBatchGetQueryType(query_type);
+}
+
 inline bool ParseOptimizerInt64(const rapidjson::Value &value, int64_t &parsed_value) {
     if (value.IsInt64()) {
         parsed_value = value.GetInt64();

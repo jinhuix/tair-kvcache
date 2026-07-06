@@ -355,7 +355,7 @@ TEST_F(OptEvictionManagerTest, EvictFromNonExistentInstance) {
     try {
         auto evicted = manager_->EvictByMode("non_existent_instance", instance_group_config, 0);
         // 如果没有抛出异常,检查返回值
-        EXPECT_TRUE(evicted.empty());
+        EXPECT_TRUE(evicted.evicted_blocks.empty());
     } catch (...) {
         // 如果抛出异常,也是可以接受的
         SUCCEED();

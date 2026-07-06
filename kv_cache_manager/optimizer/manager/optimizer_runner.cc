@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <variant>
 
@@ -15,14 +16,64 @@ namespace kv_cache_manager {
 namespace {
 int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
 
-[[noreturn]] void LogAndThrowReplayError(const std::string &message) {
-    KVCM_LOG_ERROR("%s", message.c_str());
-    throw std::runtime_error(message);
+void ValidateSupportedQueryTypeOrThrow(const std::string &query_type) {
+    if (!IsSupportedQueryType(query_type)) {
+        throw std::runtime_error("Unsupported optimizer query_type: " + query_type);
+    }
+}
+
+void MergeEvictedBlocks(OptIndexerManager::EvictedBlocks *dst, const OptIndexerManager::EvictedBlocks &src) {
+    if (dst == nullptr) {
+        return;
+    }
+    for (const auto &[instance_id, blocks] : src) {
+        auto &merged = (*dst)[instance_id];
+        merged.insert(merged.end(), blocks.begin(), blocks.end());
+    }
+}
+
+uint64_t MixUint64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+size_t ContiguousHitPrefixLength(const QueryHit &query_hit, size_t key_count) {
+    if (key_count == 0) {
+        return 0;
+    }
+    std::vector<bool> hit_mask(key_count, false);
+    for (const size_t idx : query_hit.local_hit_indices) {
+        if (idx < hit_mask.size()) {
+            hit_mask[idx] = true;
+        }
+    }
+    for (const size_t idx : query_hit.remote_hit_indices) {
+        if (idx < hit_mask.size()) {
+            hit_mask[idx] = true;
+        }
+    }
+
+    size_t prefix = 0;
+    while (prefix < hit_mask.size() && hit_mask[prefix]) {
+        ++prefix;
+    }
+    return prefix;
+}
+
+void KeepHitIndicesBefore(std::vector<size_t> *indices, size_t prefix_len) {
+    if (indices == nullptr) {
+        return;
+    }
+    indices->erase(
+        std::remove_if(indices->begin(), indices->end(), [prefix_len](size_t idx) { return idx >= prefix_len; }),
+        indices->end());
 }
 
 size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_size) {
     if (block_size == 0) {
-        LogAndThrowReplayError("GetCacheLocation requires positive instance block_size");
+        throw std::runtime_error("GetCacheLocation requires positive instance block_size");
     }
 
     const size_t input_tokens = trace.input_token_count();
@@ -31,7 +82,7 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
         return input_tokens;
     }
 
-    LogAndThrowReplayError(
+    throw std::runtime_error(
         "GetCacheLocation trace contains partial tail block keys: instance_id=" + trace.instance_id() +
         ", trace_id=" + trace.trace_id() + ", keys=" + std::to_string(trace.keys().size()) +
         ", input_len=" + std::to_string(input_tokens) + ", block_size=" + std::to_string(block_size) +
@@ -42,11 +93,16 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
 
 void OptimizerRunner::Run(OptimizerConfig &config) {
     write_delay_ns_ = config.trace_replay_config().write_delay_ns();
+    mamba_state_config_ = config.mamba_state_config();
     if (write_delay_ns_ <= 0) {
-        LogAndThrowReplayError("trace_replay.write_delay_ns must be positive");
+        throw std::runtime_error("trace_replay.write_delay_ns must be positive");
     }
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
+    next_mamba_state_sequence_ = 0;
+    mamba_state_checkpoints_.clear();
+    mamba_branch_prefix_history_.clear();
+    mamba_state_object_index_.clear();
 
     auto starting_time = std::chrono::high_resolution_clock::now();
     auto traces = OptimizerLoader::LoadTrace(config);
@@ -65,18 +121,17 @@ void OptimizerRunner::Run(OptimizerConfig &config) {
 void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
+    next_mamba_state_sequence_ = 0;
+    mamba_state_checkpoints_.clear();
+    mamba_branch_prefix_history_.clear();
+    mamba_state_object_index_.clear();
     for (const auto &trace : traces) {
-        ReplayTraceWithPendingWrites(trace);
+        if (trace) {
+            FlushPendingWritesThrough(trace->timestamp_ns());
+        }
+        RunTrace(trace);
     }
     FlushAllPendingWrites();
-}
-
-void OptimizerRunner::ReplayTraceWithPendingWrites(const std::shared_ptr<OptimizerSchemaTrace> &trace) {
-    if (!trace) {
-        return;
-    }
-    FlushPendingWritesThrough(trace->timestamp_ns());
-    RunTrace(trace);
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -87,10 +142,7 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
     if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
         HandleRequest(*request_trace);
     } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
-        if (get_trace->query_type() != "prefix_match") {
-            KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
-            return;
-        }
+        ValidateSupportedQueryTypeOrThrow(get_trace->query_type());
         HandleGetLocation(*get_trace);
         stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_ns());
     } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
@@ -110,19 +162,23 @@ std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &i
 }
 
 void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
-    if (trace.query_type() != "prefix_match") {
-        KVCM_LOG_WARN("Unsupported query type: %s", trace.query_type().c_str());
-        return;
-    }
-    HandleGetLocation(trace);
+    ValidateSupportedQueryTypeOrThrow(trace.query_type());
+    ReadRecord read_record = HandleGetLocation(trace);
     stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
-    ScheduleRequestWrite(trace);
+    const size_t raw_full_hit_blocks = mamba_state_config_.enabled()
+                                           ? read_record.mamba_state_candidate_blocks
+                                           : read_record.remote_hit_blocks + read_record.local_hit_blocks;
+    const size_t mamba_hit_blocks =
+        mamba_state_config_.enabled() ? read_record.mamba_state_hit_blocks : raw_full_hit_blocks;
+    ScheduleRequestWrite(trace, raw_full_hit_blocks, mamba_hit_blocks);
 }
 
-void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
+void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace,
+                                           size_t full_hit_blocks,
+                                           size_t mamba_hit_blocks) {
     if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
-        LogAndThrowReplayError("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
-                               ", trace_id=" + trace.trace_id());
+        throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
+                                 ", trace_id=" + trace.trace_id());
     }
 
     WriteCacheSchemaTrace write_trace;
@@ -131,15 +187,15 @@ void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
     write_trace.set_timestamp_ns(trace.timestamp_ns() + write_delay_ns_);
     write_trace.set_keys(trace.keys());
     write_trace.set_ttl_us(trace.ttl_us());
-    pending_writes_.push(
-        PendingWrite{write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace)});
+    pending_writes_.push(PendingWrite{
+        write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace), full_hit_blocks, mamba_hit_blocks});
 }
 
 void OptimizerRunner::FlushPendingWritesThrough(int64_t timestamp_ns) {
     while (!pending_writes_.empty() && pending_writes_.top().timestamp_ns <= timestamp_ns) {
         auto pending = pending_writes_.top();
         pending_writes_.pop();
-        RunPendingWrite(pending.trace);
+        RunPendingWrite(pending);
     }
 }
 
@@ -147,25 +203,27 @@ void OptimizerRunner::FlushAllPendingWrites() {
     while (!pending_writes_.empty()) {
         auto pending = pending_writes_.top();
         pending_writes_.pop();
-        RunPendingWrite(pending.trace);
+        RunPendingWrite(pending);
     }
 }
 
-void OptimizerRunner::RunPendingWrite(const WriteCacheSchemaTrace &trace) {
-    HandleWriteCache(trace);
-    stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
+void OptimizerRunner::RunPendingWrite(const PendingWrite &pending) {
+    HandleCacheInsert(pending.trace, true, nullptr, pending.full_hit_blocks, pending.mamba_hit_blocks);
+    stats_collector_->UpdateTimestamp(pending.trace.instance_id(), pending.trace.timestamp_ns());
 }
 
-void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
-                                       const std::string &trace_id,
-                                       const std::vector<int64_t> &keys,
-                                       int64_t timestamp_ns,
-                                       const QueryHit &query_hit,
-                                       const std::shared_ptr<RadixTreeIndex> &indexer,
-                                       size_t local_read_block_num,
-                                       size_t remote_read_block_num,
-                                       size_t input_tokens,
-                                       size_t block_size_tokens) {
+ReadRecord OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
+                                             const std::string &trace_id,
+                                             const std::vector<int64_t> &keys,
+                                             int64_t timestamp_ns,
+                                             const QueryHit &query_hit,
+                                             const std::shared_ptr<RadixTreeIndex> &indexer,
+                                             size_t local_read_block_num,
+                                             size_t remote_read_block_num,
+                                             size_t input_tokens,
+                                             size_t block_size_tokens,
+                                             size_t mamba_state_candidate_blocks,
+                                             size_t mamba_state_hit_blocks) {
     ReadRecord record{};
     record.timestamp_ns = timestamp_ns;
     record.trace_id = trace_id;
@@ -182,6 +240,8 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
 
     record.remote_hit_blocks = query_hit.remote_hit_block_num;
     record.local_hit_blocks = query_hit.local_hit_block_num;
+    record.remote_hit_indices = query_hit.remote_hit_indices;
+    record.local_hit_indices = query_hit.local_hit_indices;
     record.per_tier_hit_blocks = query_hit.per_tier_hit_block_num;
     record.input_tokens = input_tokens;
     record.block_size_tokens = block_size_tokens;
@@ -189,23 +249,28 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
     record.per_tier_blocks = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
     record.local_read_blocks = local_read_block_num;
     record.remote_read_blocks = remote_read_block_num;
+    record.mamba_state_candidate_blocks = mamba_state_candidate_blocks;
+    record.mamba_state_hit_blocks = mamba_state_hit_blocks;
 
     stats_collector_->OnReadComplete(instance_id, record);
+    return record;
 }
 
-void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
+ReadRecord OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
+                                              bool touch_local_hits,
+                                              bool local_hits_are_reads) {
+    ReadRecord record{};
     std::string instance_id = trace.instance_id();
     auto indexer = GetIndexer(instance_id);
     if (!indexer) {
-        return;
+        return record;
     }
 
     const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
     const size_t input_tokens = ValidateFullBlockTrace(trace, block_size);
 
-    // 读请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+    auto pending_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
+    HandleMambaStateEvictions(&pending_evicted_blocks);
 
     bool refresh_ttl_on_read = true;
     auto it = instance_ttl_refresh_on_read_.find(instance_id);
@@ -213,46 +278,477 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         refresh_ttl_on_read = it->second;
     }
 
+    const bool defer_full_touch_until_mamba_hit = UsesSharedMambaCapacity();
     QueryHit query_hit;
-    const bool read_triggered_tier_write =
-        indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
-    if (read_triggered_tier_write) {
-        auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-        indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
+    if (IsPrefixMatchQueryType(trace.query_type())) {
+        indexer->PrefixQuery(trace.keys(),
+                             trace.block_mask(),
+                             trace.timestamp_ns(),
+                             &query_hit,
+                             refresh_ttl_on_read,
+                             touch_local_hits,
+                             local_hits_are_reads,
+                             !defer_full_touch_until_mamba_hit);
+    } else if (IsBatchGetQueryType(trace.query_type())) {
+        indexer->BatchQuery(trace.keys(),
+                            trace.block_mask(),
+                            trace.timestamp_ns(),
+                            &query_hit,
+                            refresh_ttl_on_read,
+                            touch_local_hits,
+                            local_hits_are_reads,
+                            !defer_full_touch_until_mamba_hit);
+    } else {
+        ValidateSupportedQueryTypeOrThrow(trace.query_type());
+    }
+    indexer->ConsumeTierFlow();
+    if (indexer->ConsumeReadTriggeredTierWrite()) {
+        auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+        HandleMambaStateEvictions(&capacity_eviction.evicted_blocks);
+        MergeEvictedBlocks(&pending_evicted_blocks, capacity_eviction.evicted_blocks);
     }
 
     size_t local_read_block_num = 0;
+    size_t remote_read_block_num = trace.keys().size();
+    size_t local_mask_block_num = 0;
     if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
         const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
         const size_t n = std::min(mask_vector.size(), trace.keys().size());
-        local_read_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
+        local_mask_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
     } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
-        local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
+        local_mask_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
     }
-    size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
+    local_read_block_num = local_hits_are_reads ? local_mask_block_num : 0;
+    remote_read_block_num = trace.keys().size() - local_mask_block_num;
+    const auto [mamba_state_candidate_blocks, mamba_state_hit_blocks] =
+        ApplyMambaStateRead(instance_id, trace.keys(), trace.timestamp_ns(), &query_hit);
+    if (defer_full_touch_until_mamba_hit && mamba_state_hit_blocks > 0) {
+        std::vector<int64_t> touched_keys(trace.keys().begin(), trace.keys().begin() + mamba_state_hit_blocks);
+        indexer->TouchKeysAtTier(touched_keys, "shared", trace.timestamp_ns(), refresh_ttl_on_read);
+        indexer->ConsumeTierFlow();
+    }
 
-    SubmitReadRecord(instance_id,
-                     trace.trace_id(),
-                     trace.keys(),
-                     trace.timestamp_ns(),
-                     query_hit,
-                     indexer,
-                     local_read_block_num,
-                     remote_read_block_num,
-                     input_tokens,
-                     block_size);
+    record = SubmitReadRecord(instance_id,
+                              trace.trace_id(),
+                              trace.keys(),
+                              trace.timestamp_ns(),
+                              query_hit,
+                              indexer,
+                              local_read_block_num,
+                              remote_read_block_num,
+                              input_tokens,
+                              block_size,
+                              mamba_state_candidate_blocks,
+                              mamba_state_hit_blocks);
+    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
+    return record;
 }
 
-void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
-    std::string instance_id = trace.instance_id();
-    auto indexer = GetIndexer(instance_id);
-    if (!indexer) {
+WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
+    return HandleCacheInsert(trace, true, nullptr);
+}
+
+WriteRecord OptimizerRunner::HandleFillCachePath(const WriteCacheSchemaTrace &trace,
+                                                 const std::vector<size_t> &materialized_indices) {
+    return HandleCacheInsert(trace, false, &materialized_indices);
+}
+
+void OptimizerRunner::ClearMambaState(const std::string &instance_id) {
+    auto cache_it = mamba_state_checkpoints_.find(instance_id);
+    if (cache_it != mamba_state_checkpoints_.end()) {
+        for (auto &[_, record] : cache_it->second) {
+            for (const auto &object : record.objects) {
+                if (object != nullptr) {
+                    mamba_state_object_index_.erase(object.get());
+                    eviction_manager_->UnregisterExternalBlock(instance_id, object.get());
+                }
+            }
+        }
+    }
+    mamba_state_checkpoints_.erase(instance_id);
+    mamba_branch_prefix_history_.erase(instance_id);
+}
+
+void OptimizerRunner::ClearAllMambaStates() {
+    std::vector<std::string> instance_ids;
+    instance_ids.reserve(mamba_state_checkpoints_.size());
+    for (const auto &[instance_id, _] : mamba_state_checkpoints_) {
+        instance_ids.push_back(instance_id);
+    }
+    for (const auto &instance_id : instance_ids) {
+        ClearMambaState(instance_id);
+    }
+    mamba_branch_prefix_history_.clear();
+}
+
+std::vector<OptimizerRunner::PrefixSignature>
+OptimizerRunner::BuildPrefixSignatures(const std::vector<int64_t> &keys) const {
+    std::vector<PrefixSignature> signatures(keys.size() + 1);
+    uint64_t hash1 = 1469598103934665603ULL;
+    uint64_t hash2 = 1099511628211ULL;
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
+        const uint64_t mixed_key = MixUint64(static_cast<uint64_t>(keys[idx]));
+        hash1 ^= mixed_key;
+        hash1 *= 1099511628211ULL;
+        hash2 ^= mixed_key + 0x9e3779b97f4a7c15ULL + (hash2 << 6) + (hash2 >> 2);
+        hash2 = MixUint64(hash2);
+        signatures[idx + 1] = PrefixSignature{idx + 1, hash1, hash2};
+    }
+    return signatures;
+}
+
+std::vector<size_t> OptimizerRunner::ChunkMambaCheckpointIndices(size_t key_count) const {
+    std::vector<size_t> indices;
+    if (!mamba_state_config_.enabled() || key_count == 0 || mamba_state_config_.chunk_size_blocks() == 0) {
+        return indices;
+    }
+
+    for (size_t next = mamba_state_config_.chunk_size_blocks(); next <= key_count;
+         next += mamba_state_config_.chunk_size_blocks()) {
+        indices.push_back(next - 1);
+    }
+    const size_t request_end = key_count - 1;
+    if (indices.empty() || indices.back() != request_end) {
+        indices.push_back(request_end);
+    }
+    return indices;
+}
+
+std::vector<size_t> OptimizerRunner::BranchMambaCheckpointIndices(
+    const std::string &instance_id,
+    const std::vector<PrefixSignature> &prefix_signatures) const {
+    std::vector<size_t> indices;
+    if (!mamba_state_config_.enabled() || prefix_signatures.size() <= 1) {
+        return indices;
+    }
+    const size_t request_end = prefix_signatures.size() - 2;
+    const auto history_it = mamba_branch_prefix_history_.find(instance_id);
+    if (history_it == mamba_branch_prefix_history_.end() || history_it->second.empty()) {
+        if (mamba_state_config_.branch_save_request_end_checkpoint()) {
+            indices.push_back(request_end);
+        }
+        return indices;
+    }
+
+    const auto &history = history_it->second;
+    for (size_t prefix_len = prefix_signatures.size() - 1; prefix_len > 0; --prefix_len) {
+        if (history.find(prefix_signatures[prefix_len]) != history.end()) {
+            indices.push_back(prefix_len - 1);
+            break;
+        }
+    }
+    if (mamba_state_config_.branch_save_request_end_checkpoint() &&
+        (indices.empty() || indices.back() != request_end)) {
+        indices.push_back(request_end);
+    }
+    return indices;
+}
+
+std::vector<size_t> OptimizerRunner::SelectMambaCheckpointIndices(
+    const std::string &instance_id,
+    size_t key_count,
+    const std::vector<PrefixSignature> &prefix_signatures) const {
+    if (mamba_state_config_.checkpoint_strategy() == MambaCheckpointStrategy::BRANCH) {
+        return BranchMambaCheckpointIndices(instance_id, prefix_signatures);
+    }
+    return ChunkMambaCheckpointIndices(key_count);
+}
+
+bool OptimizerRunner::UsesSharedMambaCapacity() const {
+    return mamba_state_config_.enabled();
+}
+
+size_t OptimizerRunner::MambaCheckpointObjectCount(const MambaCheckpointRecord &record) const {
+    size_t count = 0;
+    for (const auto &object : record.objects) {
+        if (object != nullptr) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool OptimizerRunner::MambaCheckpointIsResident(const MambaCheckpointRecord &record) const {
+    if (!UsesSharedMambaCapacity()) {
+        return true;
+    }
+    if (record.objects.size() < mamba_state_config_.group_count()) {
+        return false;
+    }
+    for (size_t slot = 0; slot < mamba_state_config_.group_count(); ++slot) {
+        if (record.objects[slot] == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
+                                               const PrefixSignature &signature,
+                                               size_t group_slot,
+                                               MambaCheckpointRecord *record,
+                                               int64_t timestamp_ns) {
+    if (record == nullptr) {
+        return;
+    }
+    const size_t group_count = mamba_state_config_.group_count();
+    if (group_slot >= group_count) {
+        return;
+    }
+    if (record->objects.size() < group_count) {
+        record->objects.resize(group_count);
+    }
+    if (record->objects[group_slot] != nullptr) {
+        return;
+    }
+    const size_t group_id = group_slot + 1; // full-attention uses group id 0; Mamba groups start at 1.
+    auto object = std::make_unique<BlockEntry>();
+    const uint64_t mixed = MixUint64(signature.hash1) ^ MixUint64(signature.hash2) ^
+                           MixUint64(static_cast<uint64_t>(signature.length)) ^ MixUint64(group_id);
+    object->key = static_cast<int64_t>(mixed);
+    object->writing_time = timestamp_ns;
+    object->last_access_time = -1;
+    object->ttl_anchor_time = timestamp_ns;
+    object->location_map["shared"] = TierStat{0, -1, timestamp_ns, 1};
+    BlockEntry *ptr = object.get();
+    record->objects[group_slot] = std::move(object);
+    mamba_state_object_index_[ptr] = MambaObjectRef{instance_id, signature, group_id};
+    eviction_manager_->RegisterExternalBlock(instance_id, ptr);
+}
+
+void OptimizerRunner::TouchMambaCheckpointObjects(const std::string &instance_id,
+                                                  MambaCheckpointRecord *record,
+                                                  int64_t timestamp_ns) {
+    if (record == nullptr || !UsesSharedMambaCapacity()) {
+        return;
+    }
+    for (const auto &object : record->objects) {
+        if (object != nullptr) {
+            eviction_manager_->TouchExternalBlock(instance_id, object.get(), timestamp_ns, true);
+        }
+    }
+}
+
+size_t OptimizerRunner::HandleMambaStateEvictions(OptIndexerManager::EvictedBlocks *evicted_blocks) {
+    size_t evicted = 0;
+    if (evicted_blocks == nullptr) {
+        return evicted;
+    }
+    for (auto &[_, blocks] : *evicted_blocks) {
+        auto out_it = blocks.begin();
+        for (auto *block : blocks) {
+            auto object_it = mamba_state_object_index_.find(block);
+            if (object_it == mamba_state_object_index_.end()) {
+                *out_it++ = block;
+                continue;
+            }
+            const auto ref = object_it->second;
+            mamba_state_object_index_.erase(object_it);
+            auto cache_it = mamba_state_checkpoints_.find(ref.instance_id);
+            if (cache_it == mamba_state_checkpoints_.end()) {
+                continue;
+            }
+            auto record_it = cache_it->second.find(ref.signature);
+            if (record_it == cache_it->second.end()) {
+                continue;
+            }
+            auto &objects = record_it->second.objects;
+            bool cleared = false;
+            if (ref.group_id > 0) {
+                const size_t slot = ref.group_id - 1;
+                if (slot < objects.size() && objects[slot].get() == block) {
+                    objects[slot].reset();
+                    cleared = true;
+                }
+            }
+            if (!cleared) {
+                for (auto &object : objects) {
+                    if (object.get() == block) {
+                        object.reset();
+                        break;
+                    }
+                }
+            }
+            if (MambaCheckpointObjectCount(record_it->second) == 0) {
+                cache_it->second.erase(record_it);
+            }
+            ++evicted;
+        }
+        blocks.erase(out_it, blocks.end());
+    }
+    return evicted;
+}
+
+void OptimizerRunner::ObserveMambaBranchPrefixes(const std::string &instance_id,
+                                                 const std::vector<PrefixSignature> &prefix_signatures) {
+    if (mamba_state_config_.checkpoint_strategy() != MambaCheckpointStrategy::BRANCH || prefix_signatures.size() <= 1) {
         return;
     }
 
-    // 写请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+    auto &history = mamba_branch_prefix_history_[instance_id];
+    for (size_t prefix_len = 1; prefix_len < prefix_signatures.size(); ++prefix_len) {
+        history.insert(prefix_signatures[prefix_len]);
+    }
+}
+
+std::pair<size_t, size_t> OptimizerRunner::ApplyMambaStateRead(const std::string &instance_id,
+                                                               const std::vector<int64_t> &keys,
+                                                               int64_t timestamp_ns,
+                                                               QueryHit *query_hit) {
+    if (!mamba_state_config_.enabled() || query_hit == nullptr) {
+        return {0, 0};
+    }
+
+    auto &checkpoints = mamba_state_checkpoints_[instance_id];
+
+    const size_t candidate_prefix = ContiguousHitPrefixLength(*query_hit, keys.size());
+    if (candidate_prefix == 0 || checkpoints.empty()) {
+        query_hit->remote_hit_block_num = 0;
+        query_hit->local_hit_block_num = 0;
+        query_hit->remote_hit_indices.clear();
+        query_hit->local_hit_indices.clear();
+        std::fill(query_hit->per_tier_hit_block_num.begin(), query_hit->per_tier_hit_block_num.end(), 0);
+        return {candidate_prefix, 0};
+    }
+
+    const auto signatures = BuildPrefixSignatures(keys);
+    size_t hit_blocks = 0;
+    for (size_t prefix_len = candidate_prefix; prefix_len > 0; --prefix_len) {
+        auto checkpoint_it = checkpoints.find(signatures[prefix_len]);
+        if (checkpoint_it != checkpoints.end() && MambaCheckpointIsResident(checkpoint_it->second)) {
+            hit_blocks = prefix_len;
+            checkpoint_it->second.last_access_ns = timestamp_ns;
+            checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+            TouchMambaCheckpointObjects(instance_id, &checkpoint_it->second, timestamp_ns);
+            break;
+        }
+    }
+
+    KeepHitIndicesBefore(&query_hit->local_hit_indices, hit_blocks);
+    KeepHitIndicesBefore(&query_hit->remote_hit_indices, hit_blocks);
+    query_hit->local_hit_block_num = query_hit->local_hit_indices.size();
+    query_hit->remote_hit_block_num = query_hit->remote_hit_indices.size();
+
+    size_t remaining_tier_hits = query_hit->local_hit_block_num + query_hit->remote_hit_block_num;
+    for (auto &tier_hits : query_hit->per_tier_hit_block_num) {
+        const size_t kept = std::min(tier_hits, remaining_tier_hits);
+        tier_hits = kept;
+        remaining_tier_hits -= kept;
+    }
+    return {candidate_prefix, hit_blocks};
+}
+
+void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
+                                           const std::vector<int64_t> &keys,
+                                           int64_t timestamp_ns,
+                                           const std::vector<size_t> *materialized_indices,
+                                           size_t min_checkpoint_prefix_blocks) {
+    if (!mamba_state_config_.enabled() || keys.empty()) {
+        return;
+    }
+
+    const auto signatures = BuildPrefixSignatures(keys);
+    const auto checkpoint_indices = SelectMambaCheckpointIndices(instance_id, keys.size(), signatures);
+    if (checkpoint_indices.empty()) {
+        ObserveMambaBranchPrefixes(instance_id, signatures);
+        return;
+    }
+
+    std::vector<bool> allowed(keys.size(), true);
+    if (materialized_indices != nullptr) {
+        std::fill(allowed.begin(), allowed.end(), false);
+        for (const size_t idx : *materialized_indices) {
+            if (idx < allowed.size()) {
+                allowed[idx] = true;
+            }
+        }
+    }
+
+    auto &checkpoints = mamba_state_checkpoints_[instance_id];
+    for (const size_t idx : checkpoint_indices) {
+        if (idx >= allowed.size() || !allowed[idx]) {
+            continue;
+        }
+        const size_t checkpoint_prefix_blocks = idx + 1;
+        if (checkpoint_prefix_blocks <= min_checkpoint_prefix_blocks) {
+            continue;
+        }
+        auto checkpoint_it = checkpoints.find(signatures[idx + 1]);
+        if (checkpoint_it == checkpoints.end()) {
+            checkpoint_it =
+                checkpoints.emplace(signatures[idx + 1], MambaCheckpointRecord{timestamp_ns, next_mamba_state_sequence_++})
+                    .first;
+        }
+
+        if (UsesSharedMambaCapacity()) {
+            for (size_t slot = 0; slot < mamba_state_config_.group_count(); ++slot) {
+                RegisterMambaStateObject(instance_id, signatures[idx + 1], slot, &checkpoint_it->second, timestamp_ns);
+            }
+            checkpoint_it->second.last_access_ns = timestamp_ns;
+            checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+        } else {
+            checkpoint_it->second.last_access_ns = timestamp_ns;
+            checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+        }
+    }
+    ObserveMambaBranchPrefixes(instance_id, signatures);
+    EvictMambaStateIfNeeded(instance_id);
+}
+
+size_t OptimizerRunner::EvictMambaStateIfNeeded(const std::string &instance_id) {
+    const size_t limit = mamba_state_config_.max_resident_checkpoints();
+    if (limit == 0) {
+        return 0;
+    }
+    auto cache_it = mamba_state_checkpoints_.find(instance_id);
+    if (cache_it == mamba_state_checkpoints_.end()) {
+        return 0;
+    }
+    auto &checkpoints = cache_it->second;
+    size_t evicted = 0;
+    while (checkpoints.size() > limit) {
+        auto oldest = checkpoints.end();
+        for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+            if (oldest == checkpoints.end() ||
+                std::tie(it->second.last_access_ns, it->second.sequence) <
+                    std::tie(oldest->second.last_access_ns, oldest->second.sequence)) {
+                oldest = it;
+            }
+        }
+        if (oldest == checkpoints.end()) {
+            break;
+        }
+        if (UsesSharedMambaCapacity()) {
+            for (const auto &object : oldest->second.objects) {
+                if (object != nullptr) {
+                    mamba_state_object_index_.erase(object.get());
+                    eviction_manager_->UnregisterExternalBlock(instance_id, object.get());
+                }
+            }
+        }
+        checkpoints.erase(oldest);
+        ++evicted;
+    }
+    return evicted;
+}
+
+WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trace,
+                                               bool count_new_tier_write_touch,
+                                               const std::vector<size_t> *materialized_indices,
+                                               size_t full_hit_blocks,
+                                               size_t mamba_hit_blocks) {
+    WriteRecord record;
+    record.timestamp_ns = trace.timestamp_ns();
+    record.trace_id = trace.trace_id();
+
+    std::string instance_id = trace.instance_id();
+    auto indexer = GetIndexer(instance_id);
+    if (!indexer) {
+        return record;
+    }
+
+    auto pending_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
+    HandleMambaStateEvictions(&pending_evicted_blocks);
 
     int64_t effective_ttl_ns = TtlUsToNs(trace.ttl_us());
     auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
@@ -260,9 +756,29 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         effective_ttl_ns = -1;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
-    auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
+    std::vector<size_t> mamba_checkpoint_admission_indices;
+    const std::vector<size_t> *effective_materialized_indices = materialized_indices;
+    if (count_new_tier_write_touch && materialized_indices == nullptr && mamba_state_config_.enabled()) {
+        const size_t first_materialized_block = full_hit_blocks;
+        for (size_t idx = first_materialized_block; idx < trace.keys().size(); ++idx) {
+            mamba_checkpoint_admission_indices.push_back(idx);
+        }
+        effective_materialized_indices = &mamba_checkpoint_admission_indices;
+    }
+
+    RadixTreeIndex::InsertResult result;
+    if (count_new_tier_write_touch && effective_materialized_indices == nullptr) {
+        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
+    } else if (effective_materialized_indices != nullptr) {
+        result =
+            indexer->FillPathOnly(trace.keys(), *effective_materialized_indices, trace.timestamp_ns(), effective_ttl_ns);
+    } else {
+        throw std::runtime_error("HandleCacheInsert fill requires materialized indices");
+    }
+    auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    HandleMambaStateEvictions(&capacity_eviction.evicted_blocks);
+    const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
+    MergeEvictedBlocks(&pending_evicted_blocks, capacity_evicted_blocks);
     bool evicted = !capacity_evicted_blocks.empty();
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
@@ -270,11 +786,28 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
                        instance_id.c_str());
     }
 
-    WriteRecord record;
-    record.timestamp_ns = trace.timestamp_ns();
-    record.write_blocks = trace.keys().size();
+    size_t write_blocks = trace.keys().size();
+    if (effective_materialized_indices != nullptr) {
+        std::vector<bool> selected(trace.keys().size(), false);
+        for (const size_t idx : *effective_materialized_indices) {
+            if (idx < selected.size()) {
+                selected[idx] = true;
+            }
+        }
+        write_blocks = std::count(selected.begin(), selected.end(), true);
+    }
+    record.write_blocks = write_blocks;
     record.newly_inserted_blocks = result.inserted_keys.size();
-    record.trace_id = trace.trace_id();
-    stats_collector_->OnWriteComplete(instance_id, record);
+    ApplyMambaStateWrite(instance_id, trace.keys(), trace.timestamp_ns(), nullptr, mamba_hit_blocks);
+    if (UsesSharedMambaCapacity()) {
+        auto mamba_capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+        HandleMambaStateEvictions(&mamba_capacity_eviction.evicted_blocks);
+        MergeEvictedBlocks(&pending_evicted_blocks, mamba_capacity_eviction.evicted_blocks);
+    }
+    if (count_new_tier_write_touch) {
+        stats_collector_->OnWriteComplete(instance_id, record);
+    }
+    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
+    return record;
 }
 } // namespace kv_cache_manager

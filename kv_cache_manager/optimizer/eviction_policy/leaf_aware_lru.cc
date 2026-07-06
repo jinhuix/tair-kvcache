@@ -131,6 +131,23 @@ std::vector<BlockEntry *> LeafAwareLruEvictionPolicy::EvictBlocks(size_t count) 
     return evicted_blocks;
 }
 
+bool LeafAwareLruEvictionPolicy::RemoveBlock(BlockEntry *block) {
+    auto it = node_map_.find(block);
+    if (it == node_map_.end()) {
+        return false;
+    }
+    auto *node = it->second;
+    if (leaf_blocks_.find(block) != leaf_blocks_.end()) {
+        leaf_lru_list_.remove(node);
+        leaf_blocks_.erase(block);
+    } else {
+        delete node;
+    }
+    node_map_.erase(it);
+    ClearBlockLocation(block);
+    return true;
+}
+
 bool LeafAwareLruEvictionPolicy::UpdateNodeState(RadixTreeNode *node) {
     if (node == nullptr) {
         return false;

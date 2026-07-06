@@ -31,6 +31,7 @@ enum class TierWriteMode {
 struct TierFlowStrategy {
     TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled = true;
+    bool write_propagation_enabled = true;
     bool promote_enabled = false;
     size_t selective_write_threshold = 2;
 };
@@ -38,6 +39,7 @@ struct TierStat {
     size_t access_count = 0;
     int64_t last_access_time = -1;
     int64_t writing_time = -1;
+    size_t write_touch_count = 0;
 };
 using LocationStatMap = std::unordered_map<std::string, TierStat>;
 
@@ -97,6 +99,8 @@ struct RadixTreeNode {
 struct QueryHit {
     size_t local_hit_block_num = 0;
     size_t remote_hit_block_num = 0;
+    std::vector<size_t> local_hit_indices;
+    std::vector<size_t> remote_hit_indices;
     std::vector<size_t> per_tier_hit_block_num; // indexed by tier priority order
 };
 

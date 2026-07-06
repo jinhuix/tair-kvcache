@@ -43,7 +43,6 @@ OptimizerConfig OptimizerManagerTest::CreateTestOptimizerConfig() {
     tier1.set_capacity(1024 * 1024 * 10);
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     instance_group.set_storages({tier1});
 
     // 添加实例配置到实例组
@@ -103,6 +102,24 @@ TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
     EXPECT_EQ(hit_after_expire.kvcm_hit_length, 0);
 }
 
+TEST_F(OptimizerManagerTest, BatchGetMatchesIndexedBlocksWithoutPrefix) {
+    OptimizerManager manager(config_);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> path = {21, 22};
+    manager.WriteCache("instance1", "write_path", 1000, path);
+
+    BlockMask remote_read_mask = std::vector<bool>{false};
+    auto prefix_miss = manager.GetCacheLocation("instance1", "prefix_miss", 2000, {22}, remote_read_mask, 1024);
+    EXPECT_EQ(prefix_miss.kvcm_hit_length, 0);
+
+    auto batch_hit =
+        manager.GetCacheLocation("instance1", "batch_hit", 3000, {22}, remote_read_mask, 1024, true, true, "batch_get");
+    EXPECT_EQ(batch_hit.kvcm_hit_length, 1);
+    ASSERT_EQ(batch_hit.hit_indices.size(), 1);
+    EXPECT_EQ(batch_hit.hit_indices[0], 0);
+}
+
 TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
     OptimizerManager manager(config_, false, true);
     ASSERT_TRUE(manager.Init());
@@ -137,6 +154,191 @@ TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     ASSERT_NE(last_read, nullptr);
     EXPECT_EQ(last_read->input_tokens, 1537);
     EXPECT_EQ(last_read->remote_hit_blocks, 1);
+}
+
+TEST_F(OptimizerManagerTest, MambaStateCheckpointsGateOptimizerRunHits) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_chunk_size_blocks(2);
+    mamba_state.set_bytes_per_state(128);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> full_request = {1, 2, 3, 4, 5};
+    manager.WriteCache("instance1", "write_full", 1000, full_request);
+
+    BlockMask remote_read_mask = std::vector<bool>{false, false, false};
+    auto partial_hit = manager.GetCacheLocation("instance1", "read_three", 2000, {1, 2, 3}, remote_read_mask, 48);
+    EXPECT_EQ(partial_hit.kvcm_hit_length, 2);
+
+    const auto *partial_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(partial_record, nullptr);
+    EXPECT_EQ(partial_record->remote_hit_blocks, 2);
+    EXPECT_EQ(partial_record->mamba_state_candidate_blocks, 3);
+    EXPECT_EQ(partial_record->mamba_state_hit_blocks, 2);
+
+    BlockMask full_remote_read_mask = std::vector<bool>{false, false, false, false, false};
+    auto full_hit = manager.GetCacheLocation("instance1", "read_full", 3000, full_request, full_remote_read_mask, 80);
+    EXPECT_EQ(full_hit.kvcm_hit_length, 5);
+
+    const auto *full_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(full_record, nullptr);
+    EXPECT_EQ(full_record->remote_hit_blocks, 5);
+    EXPECT_EQ(full_record->mamba_state_candidate_blocks, 5);
+    EXPECT_EQ(full_record->mamba_state_hit_blocks, 5);
+}
+
+TEST_F(OptimizerManagerTest, MambaStateBranchCheckpointUsesDeepestHistoricalPrefix) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_bytes_per_state(128);
+    mamba_state.set_group_count(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first_request = {1, 2, 3, 4};
+    manager.WriteCache("instance1", "write_first", 1000, first_request);
+
+    const std::vector<int64_t> branch_request = {1, 2, 9};
+    manager.WriteCache("instance1", "write_branch", 2000, branch_request);
+
+    BlockMask branch_mask = std::vector<bool>{false, false, false};
+    auto branch_hit =
+        manager.GetCacheLocation("instance1", "read_branch", 3000, branch_request, branch_mask, 48);
+    EXPECT_EQ(branch_hit.kvcm_hit_length, 2);
+
+    const auto *branch_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(branch_read, nullptr);
+    EXPECT_EQ(branch_read->mamba_state_candidate_blocks, 3);
+    EXPECT_EQ(branch_read->mamba_state_hit_blocks, 2);
+
+    manager.WriteCache("instance1", "write_repeat", 4000, first_request);
+
+    BlockMask full_mask = std::vector<bool>{false, false, false, false};
+    auto full_hit =
+        manager.GetCacheLocation("instance1", "read_repeat", 5000, first_request, full_mask, 64);
+    EXPECT_EQ(full_hit.kvcm_hit_length, 4);
+
+    const auto *full_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(full_read, nullptr);
+    EXPECT_EQ(full_read->mamba_state_candidate_blocks, 4);
+    EXPECT_EQ(full_read->mamba_state_hit_blocks, 4);
+}
+
+TEST_F(OptimizerManagerTest, MambaStateBranchCanAlsoSaveRequestEndCheckpoint) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_branch_save_request_end_checkpoint(true);
+    mamba_state.set_bytes_per_state(128);
+    mamba_state.set_group_count(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first_request = {1, 2, 3};
+    manager.WriteCache("instance1", "write_first", 1000, first_request);
+
+    BlockMask remote_mask = std::vector<bool>{false, false, false};
+    auto full_hit =
+        manager.GetCacheLocation("instance1", "read_first", 2000, first_request, remote_mask, 48);
+    EXPECT_EQ(full_hit.kvcm_hit_length, 3);
+
+    const auto *read_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(read_record, nullptr);
+    EXPECT_EQ(read_record->mamba_state_candidate_blocks, 3);
+    EXPECT_EQ(read_record->mamba_state_hit_blocks, 3);
+}
+
+TEST_F(OptimizerManagerTest, MambaStateResidentCheckpointsUseLruEviction) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_chunk_size_blocks(2);
+    mamba_state.set_bytes_per_state(128);
+    mamba_state.set_group_count(3);
+    mamba_state.set_max_resident_checkpoints(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first_request = {1, 2, 3, 4};
+    manager.WriteCache("instance1", "write_first", 1000, first_request);
+
+    BlockMask first_two_mask = std::vector<bool>{false, false};
+    auto hot_checkpoint =
+        manager.GetCacheLocation("instance1", "touch_first_checkpoint", 2000, {1, 2}, first_two_mask, 32);
+    EXPECT_EQ(hot_checkpoint.kvcm_hit_length, 2);
+
+    manager.WriteCache("instance1", "write_second", 3000, {10, 11});
+
+    BlockMask full_mask = std::vector<bool>{false, false, false, false};
+    auto after_eviction =
+        manager.GetCacheLocation("instance1", "read_first_after_eviction", 4000, first_request, full_mask, 64);
+    EXPECT_EQ(after_eviction.kvcm_hit_length, 2);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->mamba_state_candidate_blocks, 4);
+    EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
 }
 
 TEST_F(OptimizerManagerTest, ReadRejectsPartialTailBlockKeys) {
@@ -174,6 +376,7 @@ TEST_F(OptimizerManagerTest, RequestTraceSchedulesDelayedWrite) {
     config.set_output_result_path(GetTestTempRootPath() + "/request_trace_result");
 
     OptTraceReplayConfig trace_replay_config;
+    trace_replay_config.set_mode(TraceReplayMode::REQUEST);
     trace_replay_config.set_write_delay_ns(1000);
     config.set_trace_replay_config(trace_replay_config);
 

@@ -15,13 +15,24 @@ public:
     virtual size_t size() const = 0;
 
     virtual void OnBlockWritten(BlockEntry *block) = 0;
+    virtual void OnBlockCopied(BlockEntry *block) { OnBlockWritten(block); }
     virtual void OnNodeWritten(std::vector<BlockEntry *> &blocks) = 0;
     virtual void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
         (void)refresh_ttl_on_read;
         OnBlockAccessed(block, timestamp);
     }
+    virtual void OnBlockTouched(BlockEntry *block, int64_t timestamp) {
+        OnBlockAccessedWithOptions(block, timestamp, false);
+    }
     virtual std::vector<BlockEntry *> EvictBlocks(size_t num_blocks) = 0;
     virtual std::vector<BlockEntry *> EvictExpired() { return {}; }
+    virtual bool RemoveBlock(BlockEntry *block) {
+        if (block == nullptr) {
+            return false;
+        }
+        ClearBlockLocation(block);
+        return true;
+    }
     virtual void Clear() = 0;
     virtual bool NeedCapacityEviction() const { return true; }
     virtual void AdvanceClock(int64_t timestamp) { (void)timestamp; }

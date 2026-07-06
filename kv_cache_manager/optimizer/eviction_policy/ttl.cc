@@ -176,6 +176,18 @@ std::vector<BlockEntry *> TtlEvictionPolicy::EvictExpired() { return HarvestExpi
 
 void TtlEvictionPolicy::EvictOne(BlockEntry *block) { ClearBlockLocation(block); }
 
+bool TtlEvictionPolicy::RemoveBlock(BlockEntry *block) {
+    auto it = node_map_.find(block);
+    if (it == node_map_.end()) {
+        return false;
+    }
+    EvictOne(block);
+    expire_event_version_.erase(block);
+    list_.remove(it->second);
+    node_map_.erase(it);
+    return true;
+}
+
 void TtlEvictionPolicy::Clear() {
     for (auto &[block, node] : node_map_) {
         ClearBlockLocation(block);

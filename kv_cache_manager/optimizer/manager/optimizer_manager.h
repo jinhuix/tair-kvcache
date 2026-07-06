@@ -38,7 +38,10 @@ public:
                                          const int64_t timestamp,
                                          const std::vector<int64_t> &block_ids,
                                          const BlockMask &block_mask,
-                                         const int64_t input_len);
+                                         const int64_t input_len,
+                                         bool touch_local_hits = true,
+                                         bool local_hits_are_reads = true,
+                                         const std::string &query_type = "prefix_match");
     void AnalyzeResults();
 
     // 导出前缀树用于可视化

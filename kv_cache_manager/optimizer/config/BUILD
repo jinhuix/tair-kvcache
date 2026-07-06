@@ -23,6 +23,6 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/common:jsonizable",
-        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/data_storage:common_define",
     ],
 )

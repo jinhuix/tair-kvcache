@@ -28,6 +28,7 @@ public:
 
     // 驱逐 count 个块（分批，每批按 RandomLRU）
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
+    bool RemoveBlock(BlockEntry *block) override;
     void Clear() override;
     size_t size() const override { return blocks_.size(); }
 
@@ -38,9 +39,6 @@ private:
     // 从候选块中选出 k 个 LRU 的块（按 last_access_time 排序）
 
     std::vector<BlockEntry *> SampleAndPickLru(size_t sample_size, size_t batch);
-    // 删除指定 block（O(1）swap-pop）
-    void RemoveBlock(BlockEntry *block);
-
     inline size_t FastRand(size_t mod);
 };
 

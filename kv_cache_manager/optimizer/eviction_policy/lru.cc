@@ -155,6 +155,18 @@ std::vector<BlockEntry *> LruEvictionPolicy::EvictBlocks(size_t count) {
     return evicted_blocks;
 }
 
+bool LruEvictionPolicy::RemoveBlock(BlockEntry *block) {
+    auto it = node_map_.find(block);
+    if (it == node_map_.end()) {
+        return false;
+    }
+    auto *node = it->second;
+    shard_lists_[GetShardIndex(block)].remove(node);
+    node_map_.erase(it);
+    ClearBlockLocation(block);
+    return true;
+}
+
 void LruEvictionPolicy::Clear() {
     for (auto &[block, node] : node_map_) {
         ClearBlockLocation(block);

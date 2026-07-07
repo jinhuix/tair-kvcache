@@ -769,17 +769,6 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
     } else {
         throw std::runtime_error("HandleCacheInsert fill requires materialized indices");
     }
-    auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-    HandleMambaStateEvictions(&capacity_eviction.evicted_blocks);
-    const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
-    MergeEvictedBlocks(&pending_evicted_blocks, capacity_evicted_blocks);
-    bool evicted = !capacity_evicted_blocks.empty();
-    if (evicted) {
-        KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
-                       static_cast<long long>(trace.timestamp_ns()),
-                       instance_id.c_str());
-    }
-
     size_t write_blocks = trace.keys().size();
     if (effective_materialized_indices != nullptr) {
         std::vector<bool> selected(trace.keys().size(), false);
@@ -793,10 +782,14 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
     record.write_blocks = write_blocks;
     record.newly_inserted_blocks = result.inserted_keys.size();
     ApplyMambaStateWrite(instance_id, trace.keys(), trace.timestamp_ns(), nullptr, mamba_hit_blocks);
-    if (UsesSharedMambaCapacity()) {
-        auto mamba_capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-        HandleMambaStateEvictions(&mamba_capacity_eviction.evicted_blocks);
-        MergeEvictedBlocks(&pending_evicted_blocks, mamba_capacity_eviction.evicted_blocks);
+    auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    HandleMambaStateEvictions(&capacity_eviction.evicted_blocks);
+    const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
+    MergeEvictedBlocks(&pending_evicted_blocks, capacity_evicted_blocks);
+    if (!capacity_evicted_blocks.empty()) {
+        KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
+                       static_cast<long long>(trace.timestamp_ns()),
+                       instance_id.c_str());
     }
     if (count_new_tier_write_touch) {
         stats_collector_->OnWriteComplete(instance_id, record);

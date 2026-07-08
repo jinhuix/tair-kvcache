@@ -341,7 +341,7 @@ TEST_F(OptimizerManagerTest, MambaStateResidentCheckpointsUseLruEviction) {
     EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
 }
 
-TEST_F(OptimizerManagerTest, PromoteLruKeepsMambaHitPrefixUnderSharedCapacityPressure) {
+TEST_F(OptimizerManagerTest, CapacityEvictionReservesSpaceBeforeAdmission) {
     auto config = CreateTestOptimizerConfig();
     OptMambaStateConfig mamba_state;
     mamba_state.set_enabled(true);
@@ -377,12 +377,110 @@ TEST_F(OptimizerManagerTest, PromoteLruKeepsMambaHitPrefixUnderSharedCapacityPre
 
     manager.WriteCache("instance1", "write_cold", 3000, {10, 11});
 
-    auto hot_after_pressure =
-        manager.GetCacheLocation("instance1", "read_hot_after_pressure", 4000, hot_prefix, hot_mask, 2);
-    EXPECT_EQ(hot_after_pressure.kvcm_hit_length, 2);
+    auto cold_after_admission =
+        manager.GetCacheLocation("instance1", "read_cold_after_admission", 4000, {10, 11}, hot_mask, 2);
+    EXPECT_EQ(cold_after_admission.kvcm_hit_length, 2);
+}
+
+TEST_F(OptimizerManagerTest, PromoteLruHotAdmitsBranchCheckpointAndPrefix) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(4);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    PromoteLruParams promote_lru_params;
+    promote_lru_params.shard_count = 1;
+    promote_lru_params.sample_times = 1;
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_PROMOTE_LRU);
+    instances[0].set_eviction_policy_param(promote_lru_params);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    manager.WriteCache("instance1", "write_first", 1000, {1, 2, 3, 4});
+
+    // The second request shares prefix {1, 2}. Its branch checkpoint is created during write.
+    // Capacity pressure in the same write would evict {1, 2} under cold admission.
+    manager.WriteCache("instance1", "write_branch", 2000, {1, 2, 9});
+
+    BlockMask branch_mask = std::vector<bool>{false, false, false};
+    auto branch_after_pressure =
+        manager.GetCacheLocation("instance1", "read_branch_after_pressure", 3000, {1, 2, 9}, branch_mask, 3);
+    EXPECT_EQ(branch_after_pressure.kvcm_hit_length, 2);
 
     const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
     ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->mamba_state_candidate_blocks, 3);
+    EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
+}
+
+TEST_F(OptimizerManagerTest, DirectRunTraceFilePreservesMambaStateAcrossWarmupReset) {
+    auto config = CreateTestOptimizerConfig();
+    const std::string warmup_trace = GetTestTempRootPath() + "/warmup_mamba_trace.jsonl";
+    const std::string measure_trace = GetTestTempRootPath() + "/measure_mamba_trace.jsonl";
+    config.set_trace_file_path(warmup_trace);
+
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_chunk_size_blocks(2);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(6);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    PromoteLruParams promote_lru_params;
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_PROMOTE_LRU);
+    instances[0].set_eviction_policy_param(promote_lru_params);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    {
+        std::ofstream out(warmup_trace);
+        out << R"({"type":"write","instance_id":"instance1","trace_id":"write_hot","timestamp_ns":1000,"keys":[1,2]})"
+            << "\n";
+        out << R"({"type":"get","instance_id":"instance1","trace_id":"read_hot","timestamp_ns":2000,"keys":[1,2],"input_len":2,"block_mask":[false,false]})"
+            << "\n";
+    }
+    {
+        std::ofstream out(measure_trace);
+        out << R"({"type":"write","instance_id":"instance1","trace_id":"write_cold","timestamp_ns":3000,"keys":[10,11]})"
+            << "\n";
+        out << R"({"type":"get","instance_id":"instance1","trace_id":"read_hot_after_reset","timestamp_ns":4000,"keys":[1,2],"input_len":2,"block_mask":[false,false]})"
+            << "\n";
+    }
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.ResetStats();
+    manager.DirectRunTraceFile(measure_trace);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->trace_id, "read_hot_after_reset");
+    EXPECT_EQ(last_read->remote_hit_blocks, 2);
     EXPECT_EQ(last_read->mamba_state_candidate_blocks, 2);
     EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
 }

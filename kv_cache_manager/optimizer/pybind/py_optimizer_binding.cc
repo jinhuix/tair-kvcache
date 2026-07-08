@@ -120,10 +120,19 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              "more memory). Set enable_template_analysis=True to enable template prefix analysis (slower replay)")
         .def("Init", &kvcm::OptimizerManager::Init, py::call_guard<py::gil_scoped_release>())
         .def("DirectRun", &kvcm::OptimizerManager::DirectRun, py::call_guard<py::gil_scoped_release>())
+        .def("DirectRunTraceFile",
+             &kvcm::OptimizerManager::DirectRunTraceFile,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("trace_file_path"),
+             "Replay a trace file while preserving existing cache state")
         .def("AnalyzeResults",
              &kvcm::OptimizerManager::AnalyzeResults,
              py::call_guard<py::gil_scoped_release>(),
              "Finalize, export and reset all registered trackers")
+        .def("ResetStats",
+             &kvcm::OptimizerManager::ResetStats,
+             py::call_guard<py::gil_scoped_release>(),
+             "Reset all registered trackers without clearing caches")
         .def("ExportRadixTrees", &kvcm::OptimizerManager::ExportRadixTrees, py::call_guard<py::gil_scoped_release>())
         .def("WriteCache",
              &kvcm::OptimizerManager::WriteCache,

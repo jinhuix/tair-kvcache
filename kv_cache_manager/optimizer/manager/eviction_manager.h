@@ -63,7 +63,8 @@ public:
     // eviction_timestamp 仅在 cascading 降级时用来写入新 tier 的 TierStat，其他分支不使用
     EvictionResult EvictByMode(const std::string &instance_id,
                                const OptInstanceGroupConfig &instance_group_config,
-                               int64_t eviction_timestamp);
+                               int64_t eviction_timestamp,
+                               size_t reserved_bytes = 0);
 
     // 显式过期驱逐：遍历所有实例调用 EvictExpired()
     std::unordered_map<std::string, std::vector<BlockEntry *>>
@@ -73,7 +74,9 @@ public:
 
     // 统一超额计算(bytes)：tier_idx 有值表示分层(对标 storages[tier_idx].capacity)，nullopt 表示非分层(对标
     // quota_capacity)
-    size_t GetExcessUsage(const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx) const;
+    size_t GetExcessUsage(const OptInstanceGroupConfig &instance_group_config,
+                          std::optional<size_t> tier_idx,
+                          size_t reserved_bytes = 0) const;
 
     // Group 用量(bytes)：tier_idx 有值表示指定 tier 的用量，nullopt 表示 shared_policy 用量
     size_t GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,

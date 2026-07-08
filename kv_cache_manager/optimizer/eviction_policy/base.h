@@ -36,6 +36,7 @@ public:
     virtual void Clear() = 0;
     virtual bool NeedCapacityEviction() const { return true; }
     virtual void AdvanceClock(int64_t timestamp) { (void)timestamp; }
+    virtual void PrepareCapacityEviction(size_t max_resident_blocks) { (void)max_resident_blocks; }
 
     const std::string &name() const { return name_; }
     void set_name(const std::string &name) { name_ = name; }

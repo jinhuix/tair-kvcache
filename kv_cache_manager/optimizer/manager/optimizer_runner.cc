@@ -91,18 +91,12 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
 }
 } // namespace
 
-void OptimizerRunner::Run(OptimizerConfig &config) {
+void OptimizerRunner::Run(OptimizerConfig &config, bool reset_runner_state) {
     write_delay_ns_ = config.trace_replay_config().write_delay_ns();
     mamba_state_config_ = config.mamba_state_config();
     if (write_delay_ns_ <= 0) {
         throw std::runtime_error("trace_replay.write_delay_ns must be positive");
     }
-    pending_writes_ = {};
-    next_pending_write_sequence_ = 0;
-    next_mamba_state_sequence_ = 0;
-    mamba_state_checkpoints_.clear();
-    mamba_branch_prefix_history_.clear();
-    mamba_state_object_index_.clear();
 
     auto starting_time = std::chrono::high_resolution_clock::now();
     auto traces = OptimizerLoader::LoadTrace(config);
@@ -112,19 +106,15 @@ void OptimizerRunner::Run(OptimizerConfig &config) {
         "Loaded %zu traces from file: %s in %ld ms", traces.size(), config.trace_file_path().c_str(), duration);
 
     starting_time = std::chrono::high_resolution_clock::now();
-    RunTraces(traces);
+    RunTraces(traces, reset_runner_state);
     ending_time = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::milliseconds>(ending_time - starting_time).count();
     KVCM_LOG_INFO("Playback traces in %ld ms", duration);
 }
 
-void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
-    pending_writes_ = {};
-    next_pending_write_sequence_ = 0;
-    next_mamba_state_sequence_ = 0;
-    mamba_state_checkpoints_.clear();
-    mamba_branch_prefix_history_.clear();
-    mamba_state_object_index_.clear();
+void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces,
+                                bool reset_runner_state) {
+    ResetReplayState(reset_runner_state);
     for (const auto &trace : traces) {
         if (trace) {
             FlushPendingWritesThrough(trace->timestamp_ns());
@@ -132,6 +122,15 @@ void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchem
         RunTrace(trace);
     }
     FlushAllPendingWrites();
+}
+
+void OptimizerRunner::ResetReplayState(bool clear_mamba_state) {
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
+    if (clear_mamba_state) {
+        ClearAllMambaStates();
+        next_mamba_state_sequence_ = 0;
+    }
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -374,6 +373,7 @@ void OptimizerRunner::ClearAllMambaStates() {
         ClearMambaState(instance_id);
     }
     mamba_branch_prefix_history_.clear();
+    mamba_state_object_index_.clear();
 }
 
 std::vector<OptimizerRunner::PrefixSignature>
@@ -478,23 +478,23 @@ bool OptimizerRunner::MambaCheckpointIsResident(const MambaCheckpointRecord &rec
     return true;
 }
 
-void OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
+bool OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
                                                const PrefixSignature &signature,
                                                size_t group_slot,
                                                MambaCheckpointRecord *record,
                                                int64_t timestamp_ns) {
     if (record == nullptr) {
-        return;
+        return false;
     }
     const size_t group_count = mamba_state_config_.group_count();
     if (group_slot >= group_count) {
-        return;
+        return false;
     }
     if (record->objects.size() < group_count) {
         record->objects.resize(group_count);
     }
     if (record->objects[group_slot] != nullptr) {
-        return;
+        return false;
     }
     const size_t group_id = group_slot + 1; // full-attention uses group id 0; Mamba groups start at 1.
     auto object = std::make_unique<BlockEntry>();
@@ -509,6 +509,7 @@ void OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
     record->objects[group_slot] = std::move(object);
     mamba_state_object_index_[ptr] = MambaObjectRef{instance_id, signature, group_id};
     eviction_manager_->RegisterExternalBlock(instance_id, ptr);
+    return true;
 }
 
 void OptimizerRunner::TouchMambaCheckpointObjects(const std::string &instance_id,
@@ -522,6 +523,151 @@ void OptimizerRunner::TouchMambaCheckpointObjects(const std::string &instance_id
             eviction_manager_->TouchExternalBlock(instance_id, object.get(), timestamp_ns, true);
         }
     }
+}
+
+bool OptimizerRunner::InstanceTtlRefreshOnRead(const std::string &instance_id) const {
+    auto it = instance_ttl_refresh_on_read_.find(instance_id);
+    if (it != instance_ttl_refresh_on_read_.end()) {
+        return it->second;
+    }
+    return true;
+}
+
+void OptimizerRunner::TouchMambaBranchPrefixOnAdmission(const std::string &instance_id,
+                                                        const std::vector<int64_t> &keys,
+                                                        size_t prefix_blocks,
+                                                        int64_t timestamp_ns) {
+    if (prefix_blocks == 0 || keys.empty()) {
+        return;
+    }
+    auto indexer = GetIndexer(instance_id);
+    if (!indexer) {
+        return;
+    }
+    const auto &tier_names = indexer->GetTierNames();
+    if (std::find(tier_names.begin(), tier_names.end(), "shared") == tier_names.end()) {
+        return;
+    }
+    const size_t touch_count = std::min(prefix_blocks, keys.size());
+    std::vector<int64_t> touched_keys(keys.begin(), keys.begin() + touch_count);
+    indexer->TouchKeysAtTier(touched_keys, "shared", timestamp_ns, InstanceTtlRefreshOnRead(instance_id));
+    indexer->ConsumeTierFlow();
+}
+
+size_t OptimizerRunner::CountMaterializedBlocks(size_t key_count,
+                                                const std::vector<size_t> *materialized_indices) const {
+    if (materialized_indices == nullptr) {
+        return key_count;
+    }
+    std::vector<bool> selected(key_count, false);
+    for (const size_t idx : *materialized_indices) {
+        if (idx < selected.size()) {
+            selected[idx] = true;
+        }
+    }
+    return static_cast<size_t>(std::count(selected.begin(), selected.end(), true));
+}
+
+size_t OptimizerRunner::EstimateMambaStateAdmissionObjects(
+    const std::string &instance_id,
+    const std::vector<int64_t> &keys,
+    const std::vector<size_t> *materialized_indices,
+    size_t min_checkpoint_prefix_blocks) const {
+    if (!mamba_state_config_.enabled() || !UsesSharedMambaCapacity() || keys.empty()) {
+        return 0;
+    }
+
+    const auto signatures = BuildPrefixSignatures(keys);
+    const auto checkpoint_indices = SelectMambaCheckpointIndices(instance_id, keys.size(), signatures);
+    if (checkpoint_indices.empty()) {
+        return 0;
+    }
+
+    std::vector<bool> allowed(keys.size(), true);
+    if (materialized_indices != nullptr) {
+        std::fill(allowed.begin(), allowed.end(), false);
+        for (const size_t idx : *materialized_indices) {
+            if (idx < allowed.size()) {
+                allowed[idx] = true;
+            }
+        }
+    }
+
+    size_t object_count = 0;
+    const auto cache_it = mamba_state_checkpoints_.find(instance_id);
+    for (const size_t idx : checkpoint_indices) {
+        if (idx >= allowed.size() || !allowed[idx]) {
+            continue;
+        }
+        const size_t checkpoint_prefix_blocks = idx + 1;
+        if (checkpoint_prefix_blocks <= min_checkpoint_prefix_blocks) {
+            continue;
+        }
+        size_t resident_objects = 0;
+        if (cache_it != mamba_state_checkpoints_.end()) {
+            const auto checkpoint_it = cache_it->second.find(signatures[idx + 1]);
+            if (checkpoint_it != cache_it->second.end()) {
+                resident_objects = MambaCheckpointObjectCount(checkpoint_it->second);
+            }
+        }
+        const size_t group_count = mamba_state_config_.group_count();
+        if (resident_objects < group_count) {
+            object_count += group_count - resident_objects;
+        }
+    }
+    return object_count;
+}
+
+size_t OptimizerRunner::MambaBranchPrefixAdmissionTouchBlocks(
+    const std::string &instance_id,
+    const std::vector<int64_t> &keys,
+    const std::vector<size_t> *materialized_indices,
+    size_t min_checkpoint_prefix_blocks) const {
+    if (!mamba_state_config_.enabled() || !UsesSharedMambaCapacity() || keys.empty() ||
+        mamba_state_config_.checkpoint_strategy() != MambaCheckpointStrategy::BRANCH) {
+        return 0;
+    }
+
+    const auto signatures = BuildPrefixSignatures(keys);
+    const auto checkpoint_indices = SelectMambaCheckpointIndices(instance_id, keys.size(), signatures);
+    const auto history_it = mamba_branch_prefix_history_.find(instance_id);
+    if (checkpoint_indices.empty() || history_it == mamba_branch_prefix_history_.end()) {
+        return 0;
+    }
+
+    std::vector<bool> allowed(keys.size(), true);
+    if (materialized_indices != nullptr) {
+        std::fill(allowed.begin(), allowed.end(), false);
+        for (const size_t idx : *materialized_indices) {
+            if (idx < allowed.size()) {
+                allowed[idx] = true;
+            }
+        }
+    }
+
+    size_t touch_blocks = 0;
+    const auto cache_it = mamba_state_checkpoints_.find(instance_id);
+    for (const size_t idx : checkpoint_indices) {
+        if (idx >= allowed.size() || !allowed[idx]) {
+            continue;
+        }
+        const size_t checkpoint_prefix_blocks = idx + 1;
+        if (checkpoint_prefix_blocks <= min_checkpoint_prefix_blocks ||
+            history_it->second.count(signatures[idx + 1]) == 0) {
+            continue;
+        }
+        size_t resident_objects = 0;
+        if (cache_it != mamba_state_checkpoints_.end()) {
+            const auto checkpoint_it = cache_it->second.find(signatures[idx + 1]);
+            if (checkpoint_it != cache_it->second.end()) {
+                resident_objects = MambaCheckpointObjectCount(checkpoint_it->second);
+            }
+        }
+        if (resident_objects < mamba_state_config_.group_count()) {
+            touch_blocks = std::max(touch_blocks, checkpoint_prefix_blocks);
+        }
+    }
+    return touch_blocks;
 }
 
 size_t OptimizerRunner::HandleMambaStateEvictions(OptIndexerManager::EvictedBlocks *evicted_blocks) {
@@ -648,6 +794,11 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
         ObserveMambaBranchPrefixes(instance_id, signatures);
         return;
     }
+    const auto history_it = mamba_branch_prefix_history_.find(instance_id);
+    const auto is_historical_branch_prefix = [&](const PrefixSignature &signature) {
+        return mamba_state_config_.checkpoint_strategy() == MambaCheckpointStrategy::BRANCH &&
+               history_it != mamba_branch_prefix_history_.end() && history_it->second.count(signature) > 0;
+    };
 
     std::vector<bool> allowed(keys.size(), true);
     if (materialized_indices != nullptr) {
@@ -676,11 +827,17 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
         }
 
         if (UsesSharedMambaCapacity()) {
+            bool registered_new_object = false;
             for (size_t slot = 0; slot < mamba_state_config_.group_count(); ++slot) {
-                RegisterMambaStateObject(instance_id, signatures[idx + 1], slot, &checkpoint_it->second, timestamp_ns);
+                registered_new_object |=
+                    RegisterMambaStateObject(instance_id, signatures[idx + 1], slot, &checkpoint_it->second, timestamp_ns);
             }
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+            if (registered_new_object && is_historical_branch_prefix(signatures[idx + 1])) {
+                TouchMambaCheckpointObjects(instance_id, &checkpoint_it->second, timestamp_ns);
+                TouchMambaBranchPrefixOnAdmission(instance_id, keys, checkpoint_prefix_blocks, timestamp_ns);
+            }
         } else {
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
@@ -760,6 +917,22 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
         effective_materialized_indices = &mamba_checkpoint_admission_indices;
     }
 
+    const size_t branch_prefix_touch_blocks =
+        MambaBranchPrefixAdmissionTouchBlocks(instance_id, trace.keys(), effective_materialized_indices, mamba_hit_blocks);
+    if (branch_prefix_touch_blocks > 0) {
+        TouchMambaBranchPrefixOnAdmission(instance_id, trace.keys(), branch_prefix_touch_blocks, trace.timestamp_ns());
+    }
+
+    const size_t admission_reserved_blocks =
+        CountMaterializedBlocks(trace.keys().size(), effective_materialized_indices) +
+        EstimateMambaStateAdmissionObjects(instance_id, trace.keys(), effective_materialized_indices, mamba_hit_blocks);
+    auto admission_eviction =
+        indexer_manager_->CheckAndEvictForAdmission(instance_id, admission_reserved_blocks, trace.timestamp_ns());
+    HandleMambaStateEvictions(&admission_eviction.evicted_blocks);
+    MergeEvictedBlocks(&pending_evicted_blocks, admission_eviction.evicted_blocks);
+    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
+    pending_evicted_blocks.clear();
+
     RadixTreeIndex::InsertResult result;
     if (count_new_tier_write_touch && effective_materialized_indices == nullptr) {
         result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
@@ -782,15 +955,6 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
     record.write_blocks = write_blocks;
     record.newly_inserted_blocks = result.inserted_keys.size();
     ApplyMambaStateWrite(instance_id, trace.keys(), trace.timestamp_ns(), nullptr, mamba_hit_blocks);
-    auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-    HandleMambaStateEvictions(&capacity_eviction.evicted_blocks);
-    const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
-    MergeEvictedBlocks(&pending_evicted_blocks, capacity_evicted_blocks);
-    if (!capacity_evicted_blocks.empty()) {
-        KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
-                       static_cast<long long>(trace.timestamp_ns()),
-                       instance_id.c_str());
-    }
     if (count_new_tier_write_touch) {
         stats_collector_->OnWriteComplete(instance_id, record);
     }

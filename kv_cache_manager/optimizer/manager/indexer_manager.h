@@ -42,6 +42,9 @@ public:
 
     // 仅做容量驱逐；返回待清理的 block 列表及 tier flow
     OptEvictionManager::EvictionResult CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp = 0);
+    OptEvictionManager::EvictionResult CheckAndEvictForAdmission(const std::string &instance_id,
+                                                                 size_t admission_blocks,
+                                                                 int64_t eviction_timestamp = 0);
 
     // 统一清理驱逐后的 block，并触发节点清理
     void CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,

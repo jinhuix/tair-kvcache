@@ -1,6 +1,7 @@
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
@@ -71,7 +72,8 @@ OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &ins
 
 OptEvictionManager::EvictionResult OptEvictionManager::EvictByMode(const std::string &instance_id,
                                                                    const OptInstanceGroupConfig &instance_group_config,
-                                                                   int64_t eviction_timestamp) {
+                                                                   int64_t eviction_timestamp,
+                                                                   size_t reserved_bytes) {
     EvictionResult result;
 
     if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
@@ -87,7 +89,7 @@ OptEvictionManager::EvictionResult OptEvictionManager::EvictByMode(const std::st
         // tier i 驱逐出的 block 才会写入 tier i+1；write-through/selective edge 不做驱逐下沉。
         const size_t num_tiers = instance_group_config.storages().size();
         for (size_t tier_idx = 0; tier_idx < num_tiers; ++tier_idx) {
-            size_t excess = GetExcessUsage(instance_group_config, tier_idx);
+            size_t excess = GetExcessUsage(instance_group_config, tier_idx, tier_idx == 0 ? reserved_bytes : 0);
             if (excess == 0) {
                 continue;
             }
@@ -122,7 +124,7 @@ OptEvictionManager::EvictionResult OptEvictionManager::EvictByMode(const std::st
 
     // 非分层分支：shared 策略按 group quota 驱逐
     std::vector<std::pair<std::optional<size_t>, size_t>> tasks;
-    size_t excess = GetExcessUsage(instance_group_config, std::nullopt);
+    size_t excess = GetExcessUsage(instance_group_config, std::nullopt, reserved_bytes);
     if (excess > 0) {
         KVCM_LOG_DEBUG("Non-hierarchical eviction: excess: %zu bytes", excess);
         tasks.emplace_back(std::nullopt, excess);
@@ -327,6 +329,14 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
             break;
         }
     }
+    if (bpb <= 0) {
+        throw std::runtime_error("EvictByInstance requires positive bytes_per_block for instance: " + instance_id);
+    }
+    const size_t bytes_per_block = static_cast<size_t>(bpb);
+    const size_t excess_blocks = (excess + bytes_per_block - 1) / bytes_per_block;
+    const size_t current_blocks = eviction_policy->size();
+    const size_t max_resident_blocks = current_blocks > excess_blocks ? current_blocks - excess_blocks : 0;
+    eviction_policy->PrepareCapacityEviction(max_resident_blocks);
 
     size_t total_evicted_bytes = 0;
     size_t round = 0;
@@ -335,7 +345,7 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
         int32_t evict_count = eviction_config_.eviction_batch_size_per_instance();
         if (precise) {
             const size_t remaining_bytes = excess - total_evicted_bytes;
-            const size_t remaining_blocks = (remaining_bytes + static_cast<size_t>(bpb) - 1) / static_cast<size_t>(bpb);
+            const size_t remaining_blocks = (remaining_bytes + bytes_per_block - 1) / bytes_per_block;
             evict_count = static_cast<int32_t>(
                 std::min(static_cast<size_t>(eviction_config_.eviction_batch_size_per_instance()), remaining_blocks));
         }
@@ -349,7 +359,7 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
         }
         evict_blocks[instance_id].insert(
             evict_blocks[instance_id].end(), round_evicted_blocks.begin(), round_evicted_blocks.end());
-        total_evicted_bytes += round_evicted_blocks.size() * static_cast<size_t>(bpb);
+        total_evicted_bytes += round_evicted_blocks.size() * bytes_per_block;
         KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu bytes)",
                        round,
                        round_evicted_blocks.size(),
@@ -427,7 +437,8 @@ size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfi
 }
 
 size_t OptEvictionManager::GetExcessUsage(const OptInstanceGroupConfig &instance_group_config,
-                                          std::optional<size_t> tier_idx) const {
+                                          std::optional<size_t> tier_idx,
+                                          size_t reserved_bytes) const {
     // group_capacity and tier capacity are stored in bytes
     int64_t capacity = 0;
     if (tier_idx.has_value()) {
@@ -443,7 +454,7 @@ size_t OptEvictionManager::GetExcessUsage(const OptInstanceGroupConfig &instance
     if (capacity < 0) {
         return 0;
     }
-    size_t current_used_bytes = GetCurrentGroupUsageBytes(instance_group_config, tier_idx);
+    size_t current_used_bytes = GetCurrentGroupUsageBytes(instance_group_config, tier_idx) + reserved_bytes;
     size_t quota_bytes = static_cast<size_t>(capacity * instance_group_config.used_percentage());
     return current_used_bytes > quota_bytes ? current_used_bytes - quota_bytes : 0;
 }

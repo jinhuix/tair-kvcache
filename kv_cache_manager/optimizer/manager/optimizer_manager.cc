@@ -212,6 +212,15 @@ void OptimizerManager::DirectRun() {
     optimizer_runner_->Run(config_);
 }
 
+void OptimizerManager::DirectRunTraceFile(const std::string &trace_file_path) {
+    if (!optimizer_runner_) {
+        KVCM_LOG_ERROR("optimizer_runner_ is not initialized");
+        return;
+    }
+    config_.set_trace_file_path(trace_file_path);
+    optimizer_runner_->Run(config_, false);
+}
+
 WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const std::string &trace_id,
                                            const int64_t timestamp,
@@ -297,6 +306,13 @@ void OptimizerManager::AnalyzeResults() {
 
     KVCM_LOG_INFO("Analysis complete and memory released (all data persisted to %s)",
                   config_.output_result_path().c_str());
+}
+
+void OptimizerManager::ResetStats() {
+    for (const auto &[instance_id, _] : instance_configs_) {
+        stats_collector_->ResetAll(instance_id);
+    }
+    KVCM_LOG_INFO("Reset statistics for all %zu instances without clearing caches", instance_configs_.size());
 }
 
 std::unordered_map<std::string, RadixTreeIndex::RadixTreeExport> OptimizerManager::ExportRadixTrees() const {

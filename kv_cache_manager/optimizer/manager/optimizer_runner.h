@@ -30,8 +30,9 @@ public:
         , instance_ttl_refresh_on_read_(instance_ttl_refresh_on_read)
         , mamba_state_config_(mamba_state_config){};
     ~OptimizerRunner() = default;
-    void Run(OptimizerConfig &config);
-    void RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
+    void Run(OptimizerConfig &config, bool reset_runner_state = true);
+    void RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces,
+                   bool reset_runner_state = true);
     void RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace);
 
 public:
@@ -92,6 +93,7 @@ private:
     };
 
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
+    void ResetReplayState(bool clear_mamba_state);
     void HandleRequest(const RequestSchemaTrace &trace);
     void ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t mamba_hit_blocks);
     void FlushPendingWritesThrough(int64_t timestamp_ns);
@@ -109,7 +111,7 @@ private:
     bool UsesSharedMambaCapacity() const;
     size_t MambaCheckpointObjectCount(const MambaCheckpointRecord &record) const;
     bool MambaCheckpointIsResident(const MambaCheckpointRecord &record) const;
-    void RegisterMambaStateObject(const std::string &instance_id,
+    bool RegisterMambaStateObject(const std::string &instance_id,
                                   const PrefixSignature &signature,
                                   size_t group_slot,
                                   MambaCheckpointRecord *record,
@@ -117,6 +119,20 @@ private:
     void TouchMambaCheckpointObjects(const std::string &instance_id,
                                      MambaCheckpointRecord *record,
                                      int64_t timestamp_ns);
+    bool InstanceTtlRefreshOnRead(const std::string &instance_id) const;
+    void TouchMambaBranchPrefixOnAdmission(const std::string &instance_id,
+                                           const std::vector<int64_t> &keys,
+                                           size_t prefix_blocks,
+                                           int64_t timestamp_ns);
+    size_t CountMaterializedBlocks(size_t key_count, const std::vector<size_t> *materialized_indices) const;
+    size_t EstimateMambaStateAdmissionObjects(const std::string &instance_id,
+                                              const std::vector<int64_t> &keys,
+                                              const std::vector<size_t> *materialized_indices,
+                                              size_t min_checkpoint_prefix_blocks) const;
+    size_t MambaBranchPrefixAdmissionTouchBlocks(const std::string &instance_id,
+                                                 const std::vector<int64_t> &keys,
+                                                 const std::vector<size_t> *materialized_indices,
+                                                 size_t min_checkpoint_prefix_blocks) const;
     size_t HandleMambaStateEvictions(OptIndexerManager::EvictedBlocks *evicted_blocks);
     void ObserveMambaBranchPrefixes(const std::string &instance_id,
                                     const std::vector<PrefixSignature> &prefix_signatures);

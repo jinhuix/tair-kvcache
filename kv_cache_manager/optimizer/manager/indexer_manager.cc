@@ -117,6 +117,36 @@ OptEvictionManager::EvictionResult OptIndexerManager::CheckAndEvict(const std::s
     return eviction_manager_->EvictByMode(instance_id, *group_config, eviction_timestamp);
 }
 
+OptEvictionManager::EvictionResult
+OptIndexerManager::CheckAndEvictForAdmission(const std::string &instance_id,
+                                             size_t admission_blocks,
+                                             int64_t eviction_timestamp) {
+    OptEvictionManager::EvictionResult empty_result;
+    if (admission_blocks == 0) {
+        return empty_result;
+    }
+    const auto *group_config = FindInstanceGroupConfig(instance_id);
+    if (!group_config) {
+        return empty_result;
+    }
+
+    size_t bytes_per_block = 0;
+    for (const auto &instance_config : group_config->instances()) {
+        if (instance_config.instance_id() == instance_id) {
+            if (instance_config.bytes_per_block() <= 0) {
+                return empty_result;
+            }
+            bytes_per_block = static_cast<size_t>(instance_config.bytes_per_block());
+            break;
+        }
+    }
+    if (bytes_per_block == 0) {
+        return empty_result;
+    }
+    return eviction_manager_->EvictByMode(
+        instance_id, *group_config, eviction_timestamp, admission_blocks * bytes_per_block);
+}
+
 void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
                                            int64_t eviction_timestamp,
                                            bool use_logical_expire_time) {

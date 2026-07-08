@@ -27,6 +27,7 @@ public:
 
 public:
     void DirectRun();
+    void DirectRunTraceFile(const std::string &trace_file_path);
 
     WriteCacheRes WriteCache(const std::string &instance_id,
                              const std::string &trace_id,
@@ -43,6 +44,7 @@ public:
                                          bool local_hits_are_reads = true,
                                          const std::string &query_type = "prefix_match");
     void AnalyzeResults();
+    void ResetStats();
 
     // 导出前缀树用于可视化
     std::unordered_map<std::string, RadixTreeIndex::RadixTreeExport> ExportRadixTrees() const;

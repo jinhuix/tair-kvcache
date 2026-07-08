@@ -21,6 +21,7 @@ public:
     void OnBlockCopied(BlockEntry *block) override;
     void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) override;
     void OnBlockTouched(BlockEntry *block, int64_t timestamp) override;
+    void PrepareCapacityEviction(size_t max_resident_blocks) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     bool RemoveBlock(BlockEntry *block) override;
     void Clear() override;
@@ -58,12 +59,33 @@ private:
     void ReturnCandidates(const std::vector<CandidateEntry> &candidates);
     void CommitEviction(const std::vector<CandidateEntry> &candidates, std::vector<BlockEntry *> &evicted_blocks);
     size_t EvictFromQueue(size_t count, bool protected_queue, std::vector<BlockEntry *> &evicted_blocks);
+    size_t QueueSize(const std::vector<LinkedList> &lists) const;
+    size_t ExternalQueueSize(const std::vector<LinkedList> &lists) const;
+    void DemoteOldestProtectedBlocks(size_t count);
+    void MaybeLogQueueMonitor(const char *reason,
+                              size_t max_resident_blocks,
+                              size_t protected_limit,
+                              size_t demoted_blocks,
+                              size_t evicted_probation_blocks,
+                              size_t evicted_protected_blocks) const;
     void ClearListLocations();
 
     bool promote_enabled_ = true;
+    double protected_queue_capacity_ratio_ = 1.0;
+    bool queue_monitor_enabled_ = false;
+    size_t queue_monitor_interval_ = 1000;
     std::vector<LinkedList> probation_shard_lists_;
     std::vector<LinkedList> protected_shard_lists_;
     std::unordered_map<BlockEntry *, PromoteListNode *> node_map_;
+
+    uint64_t prepare_calls_ = 0;
+    uint64_t evict_calls_ = 0;
+    uint64_t demote_calls_ = 0;
+    uint64_t demoted_blocks_ = 0;
+    uint64_t probation_evicted_blocks_ = 0;
+    uint64_t protected_evicted_blocks_ = 0;
+    uint64_t probation_external_evicted_blocks_ = 0;
+    uint64_t protected_external_evicted_blocks_ = 0;
 };
 
 } // namespace kv_cache_manager

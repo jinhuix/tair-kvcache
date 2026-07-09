@@ -55,6 +55,7 @@ struct PromoteLruParams : public Jsonizable {
     int32_t sample_times = 32;
     double eviction_amplification_factor = 1.0;
     double protected_queue_capacity_ratio = 1.0;
+    int64_t ttl_seconds = 0;
     bool queue_monitor_enabled = false;
     int32_t queue_monitor_interval = 1000;
     std::vector<std::string> enabled_tiers;
@@ -64,6 +65,7 @@ struct PromoteLruParams : public Jsonizable {
         KVCM_JSON_GET_MACRO(v, "sample_times", sample_times);
         KVCM_JSON_GET_MACRO(v, "eviction_amplification_factor", eviction_amplification_factor);
         KVCM_JSON_GET_DEFAULT_MACRO(v, "protected_queue_capacity_ratio", protected_queue_capacity_ratio, 1.0);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "ttl_seconds", ttl_seconds, static_cast<int64_t>(0));
         KVCM_JSON_GET_DEFAULT_MACRO(v, "queue_monitor_enabled", queue_monitor_enabled, false);
         KVCM_JSON_GET_DEFAULT_MACRO(v, "queue_monitor_interval", queue_monitor_interval, 1000);
         KVCM_JSON_GET_DEFAULT_MACRO(v, "enabled_tiers", enabled_tiers, std::vector<std::string>{});
@@ -75,6 +77,7 @@ struct PromoteLruParams : public Jsonizable {
         Put(writer, "sample_times", sample_times);
         Put(writer, "eviction_amplification_factor", eviction_amplification_factor);
         Put(writer, "protected_queue_capacity_ratio", protected_queue_capacity_ratio);
+        Put(writer, "ttl_seconds", ttl_seconds);
         Put(writer, "queue_monitor_enabled", queue_monitor_enabled);
         Put(writer, "queue_monitor_interval", queue_monitor_interval);
         Put(writer, "enabled_tiers", enabled_tiers);

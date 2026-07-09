@@ -23,6 +23,7 @@ public:
     void OnBlockTouched(BlockEntry *block, int64_t timestamp) override;
     void PrepareCapacityEviction(size_t max_resident_blocks) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
+    void AdvanceClock(int64_t timestamp) override;
     bool RemoveBlock(BlockEntry *block) override;
     void Clear() override;
 
@@ -58,9 +59,12 @@ private:
                          std::vector<CandidateEntry> &candidates);
     void ReturnCandidates(const std::vector<CandidateEntry> &candidates);
     void CommitEviction(const std::vector<CandidateEntry> &candidates, std::vector<BlockEntry *> &evicted_blocks);
+    size_t EvictExpiredFromQueue(size_t count, bool protected_queue, std::vector<BlockEntry *> &evicted_blocks);
     size_t EvictFromQueue(size_t count, bool protected_queue, std::vector<BlockEntry *> &evicted_blocks);
     size_t QueueSize(const std::vector<LinkedList> &lists) const;
     size_t ExternalQueueSize(const std::vector<LinkedList> &lists) const;
+    bool TtlEnabled() const;
+    void RefreshTtl(BlockEntry *block, int64_t timestamp);
     void DemoteOldestProtectedBlocks(size_t count);
     void MaybeLogQueueMonitor(const char *reason,
                               size_t max_resident_blocks,
@@ -72,6 +76,8 @@ private:
 
     bool promote_enabled_ = true;
     double protected_queue_capacity_ratio_ = 1.0;
+    int64_t ttl_ns_ = 0;
+    int64_t last_known_timestamp_ = 0;
     bool queue_monitor_enabled_ = false;
     size_t queue_monitor_interval_ = 1000;
     std::vector<LinkedList> probation_shard_lists_;

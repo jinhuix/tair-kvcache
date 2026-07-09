@@ -14,16 +14,18 @@ PromoteLruEvictionPolicy::PromoteLruEvictionPolicy(const std::string &name, cons
     , amplification_factor_(params.eviction_amplification_factor > 1.0 ? params.eviction_amplification_factor : 1.0)
     , promote_enabled_(PromoteEnabledForTier(params))
     , protected_queue_capacity_ratio_(std::max(0.0, std::min(params.protected_queue_capacity_ratio, 1.0)))
+    , ttl_ns_(params.ttl_seconds > 0 ? params.ttl_seconds * 1000000000LL : 0)
     , queue_monitor_enabled_(params.queue_monitor_enabled)
     , queue_monitor_interval_(params.queue_monitor_interval > 0 ? static_cast<size_t>(params.queue_monitor_interval)
                                                                  : 1000)
     , probation_shard_lists_(shard_count_)
     , protected_shard_lists_(shard_count_) {
     KVCM_LOG_INFO("Promote LRU params tier=%s promote_enabled=%d protected_queue_capacity_ratio=%.6f "
-                  "queue_monitor_enabled=%d queue_monitor_interval=%zu",
+                  "ttl_seconds=%ld queue_monitor_enabled=%d queue_monitor_interval=%zu",
                   EvictionPolicy::name().c_str(),
                   promote_enabled_,
                   protected_queue_capacity_ratio_,
+                  params.ttl_seconds,
                   queue_monitor_enabled_,
                   queue_monitor_interval_);
 }
@@ -63,6 +65,26 @@ std::vector<LinkedList> &PromoteLruEvictionPolicy::ListsForQueue(bool protected_
     return protected_queue ? protected_shard_lists_ : probation_shard_lists_;
 }
 
+bool PromoteLruEvictionPolicy::TtlEnabled() const { return ttl_ns_ > 0; }
+
+void PromoteLruEvictionPolicy::RefreshTtl(BlockEntry *block, int64_t timestamp) {
+    if (!TtlEnabled() || block == nullptr) {
+        return;
+    }
+    int64_t anchor_time = timestamp;
+    if (anchor_time < 0) {
+        anchor_time = GetTierAccessTime(block);
+    }
+    if (anchor_time < 0 || anchor_time == INT64_MAX) {
+        return;
+    }
+    if (anchor_time > last_known_timestamp_) {
+        last_known_timestamp_ = anchor_time;
+    }
+    block->ttl_ns = ttl_ns_;
+    block->ttl_anchor_time = anchor_time;
+}
+
 void PromoteLruEvictionPolicy::InsertNewBlock(BlockEntry *block) {
     if (block == nullptr) {
         return;
@@ -70,6 +92,7 @@ void PromoteLruEvictionPolicy::InsertNewBlock(BlockEntry *block) {
     auto it = node_map_.find(block);
     if (it != node_map_.end()) {
         RefreshInCurrentQueue(it->second);
+        RefreshTtl(block, GetTierAccessTime(block));
         return;
     }
 
@@ -84,6 +107,7 @@ void PromoteLruEvictionPolicy::InsertNewBlock(BlockEntry *block) {
         lists[shard_index].push_front(node);
     }
     node_map_[block] = node;
+    RefreshTtl(block, GetTierAccessTime(block));
 }
 
 void PromoteLruEvictionPolicy::OnBlockWritten(BlockEntry *block) { InsertNewBlock(block); }
@@ -125,22 +149,30 @@ void PromoteLruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timest
 void PromoteLruEvictionPolicy::OnBlockAccessedWithOptions(BlockEntry *block,
                                                           int64_t timestamp,
                                                           bool refresh_ttl_on_read) {
-    (void)timestamp;
     (void)refresh_ttl_on_read;
+    AdvanceClock(timestamp);
     auto it = node_map_.find(block);
     if (it == node_map_.end()) {
         return;
     }
+    RefreshTtl(block, timestamp);
     PromoteOrRefresh(it->second);
 }
 
 void PromoteLruEvictionPolicy::OnBlockTouched(BlockEntry *block, int64_t timestamp) {
-    (void)timestamp;
+    AdvanceClock(timestamp);
     auto it = node_map_.find(block);
     if (it == node_map_.end()) {
         return;
     }
+    RefreshTtl(block, timestamp);
     RefreshInCurrentQueue(it->second);
+}
+
+void PromoteLruEvictionPolicy::AdvanceClock(int64_t timestamp) {
+    if (timestamp > last_known_timestamp_) {
+        last_known_timestamp_ = timestamp;
+    }
 }
 
 size_t PromoteLruEvictionPolicy::QueueSize(const std::vector<LinkedList> &lists) const {
@@ -392,15 +424,68 @@ size_t PromoteLruEvictionPolicy::EvictFromQueue(size_t count,
     return evicted_blocks.size() - before;
 }
 
+size_t PromoteLruEvictionPolicy::EvictExpiredFromQueue(size_t count,
+                                                       bool protected_queue,
+                                                       std::vector<BlockEntry *> &evicted_blocks) {
+    if (!TtlEnabled() || count == 0) {
+        return 0;
+    }
+
+    auto &lists = ListsForQueue(protected_queue);
+    const size_t before = evicted_blocks.size();
+    while (evicted_blocks.size() - before < count) {
+        int32_t oldest_expired_shard = -1;
+        int64_t oldest_expire_time = INT64_MAX;
+        for (int32_t s = 0; s < shard_count_; ++s) {
+            if (lists[s].empty()) {
+                continue;
+            }
+            auto *tail_node = static_cast<PromoteListNode *>(lists[s].getTail());
+            if (tail_node == nullptr || tail_node->payload_ == nullptr) {
+                continue;
+            }
+            BlockEntry *block = tail_node->payload_;
+            if (!block->IsExpired(last_known_timestamp_)) {
+                continue;
+            }
+            const int64_t expire_time = block->ttl_anchor_time + block->ttl_ns;
+            if (expire_time < oldest_expire_time) {
+                oldest_expire_time = expire_time;
+                oldest_expired_shard = s;
+            }
+        }
+
+        if (oldest_expired_shard < 0) {
+            break;
+        }
+
+        auto *node = static_cast<PromoteListNode *>(lists[oldest_expired_shard].getTail());
+        lists[oldest_expired_shard].unlink(node);
+        std::vector<CandidateEntry> candidate{
+            {node->payload_, node, oldest_expired_shard, protected_queue},
+        };
+        CommitEviction(candidate, evicted_blocks);
+    }
+    return evicted_blocks.size() - before;
+}
+
 std::vector<BlockEntry *> PromoteLruEvictionPolicy::EvictBlocks(size_t count) {
     ++evict_calls_;
     std::vector<BlockEntry *> evicted;
     evicted.reserve(std::min(count, node_map_.size()));
     const uint64_t before_probation_evicted = probation_evicted_blocks_;
     const uint64_t before_protected_evicted = protected_evicted_blocks_;
-    const size_t probation_evicted = EvictFromQueue(count, false, evicted);
-    if (probation_evicted < count) {
-        EvictFromQueue(count - probation_evicted, true, evicted);
+    if (evicted.size() < count) {
+        EvictExpiredFromQueue(count - evicted.size(), false, evicted);
+    }
+    if (evicted.size() < count) {
+        EvictExpiredFromQueue(count - evicted.size(), true, evicted);
+    }
+    if (evicted.size() < count) {
+        EvictFromQueue(count - evicted.size(), false, evicted);
+    }
+    if (evicted.size() < count) {
+        EvictFromQueue(count - evicted.size(), true, evicted);
     }
     MaybeLogQueueMonitor("evict",
                          0,

@@ -70,7 +70,6 @@ private:
         uint64_t sequence = 0;
         WriteCacheSchemaTrace trace;
         size_t mamba_hit_blocks = 0;
-        std::vector<uint64_t> protected_checkpoint_ids;
     };
 
     struct MambaCheckpointRecord {
@@ -86,17 +85,6 @@ private:
         size_t group_id = 0;
     };
 
-    struct MambaReadResult {
-        size_t candidate_prefix_blocks = 0;
-        size_t hit_blocks = 0;
-        std::vector<uint64_t> hit_checkpoint_ids;
-    };
-
-    struct LatestMambaReadResult {
-        std::string trace_id;
-        std::vector<uint64_t> hit_checkpoint_ids;
-    };
-
     struct PendingWriteCompare {
         bool operator()(const PendingWrite &lhs, const PendingWrite &rhs) const {
             if (lhs.timestamp_ns != rhs.timestamp_ns) {
@@ -109,9 +97,7 @@ private:
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
     void ResetReplayState(bool clear_mamba_state);
     void HandleRequest(const RequestSchemaTrace &trace);
-    void ScheduleRequestWrite(const RequestSchemaTrace &trace,
-                              size_t mamba_hit_blocks,
-                              std::vector<uint64_t> protected_checkpoint_ids = {});
+    void ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t mamba_hit_blocks);
     void FlushPendingWritesThrough(int64_t timestamp_ns);
     void FlushAllPendingWrites();
     void RunPendingWrite(const PendingWrite &pending);
@@ -158,10 +144,10 @@ private:
     size_t HandleMambaStateEvictions(OptIndexerManager::EvictedBlocks *evicted_blocks);
     void ObserveMambaBranchPrefixes(const std::string &instance_id,
                                     const std::vector<PrefixSignature> &prefix_signatures);
-    MambaReadResult ApplyMambaStateRead(const std::string &instance_id,
-                                        const std::vector<int64_t> &keys,
-                                        int64_t timestamp_ns,
-                                        QueryHit *query_hit);
+    std::pair<size_t, size_t> ApplyMambaStateRead(const std::string &instance_id,
+                                                  const std::vector<int64_t> &keys,
+                                                  int64_t timestamp_ns,
+                                                  QueryHit *query_hit);
     void ApplyMambaStateWrite(const std::string &instance_id,
                               const std::vector<int64_t> &keys,
                               int64_t timestamp_ns,
@@ -171,8 +157,7 @@ private:
     WriteRecord HandleCacheInsert(const WriteCacheSchemaTrace &trace,
                                   bool count_new_tier_write_touch,
                                   const std::vector<size_t> *materialized_indices,
-                                  size_t mamba_hit_blocks = 0,
-                                  const std::vector<uint64_t> *protected_checkpoint_ids = nullptr);
+                                  size_t mamba_hit_blocks = 0);
     ReadRecord SubmitReadRecord(const std::string &instance_id,
                                 const std::string &trace_id,
                                 const std::vector<int64_t> &keys,
@@ -196,7 +181,6 @@ private:
         mamba_state_checkpoints_;
     std::unordered_map<std::string, std::unordered_set<PrefixSignature, PrefixSignatureHash>>
         mamba_branch_prefix_history_;
-    std::unordered_map<std::string, LatestMambaReadResult> latest_mamba_read_results_;
     std::unordered_map<BlockEntry *, MambaObjectRef> mamba_state_object_index_;
     int64_t write_delay_ns_ = 1;
     uint64_t next_pending_write_sequence_ = 0;

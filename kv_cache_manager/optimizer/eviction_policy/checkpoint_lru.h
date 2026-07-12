@@ -35,8 +35,6 @@ public:
                             const std::vector<BlockEntry *> &mamba_objects,
                             int64_t timestamp);
     bool TouchCheckpoint(uint64_t checkpoint_id, int64_t timestamp);
-    void SetProtectedCheckpointsForAdmission(const std::vector<uint64_t> &checkpoint_ids);
-    void ClearProtectedCheckpointsForAdmission();
     bool HasCheckpoint(uint64_t checkpoint_id) const { return checkpoints_.count(checkpoint_id) != 0; }
     size_t checkpoint_count() const { return checkpoints_.size(); }
     size_t unreferenced_full_block_count() const { return unreferenced_full_lru_.size(); }
@@ -77,7 +75,6 @@ private:
     std::unordered_map<uint64_t, CheckpointRecord> checkpoints_;
     std::unordered_map<BlockEntry *, uint64_t> mamba_to_checkpoint_;
     std::unordered_map<BlockEntry *, uint64_t> full_boundary_to_checkpoint_;
-    std::unordered_set<uint64_t> protected_checkpoints_for_admission_;
 };
 
 } // namespace kv_cache_manager

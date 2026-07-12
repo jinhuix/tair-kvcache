@@ -553,7 +553,7 @@ TEST_F(OptimizerManagerTest, CheckpointLruBranchEndSharesPrefixAndReservesOnlyMi
     EXPECT_EQ(manager.GetCacheLocation("instance1", "read_branch", 4000, {1, 2, 9}, mask3, 3).kvcm_hit_length, 3);
 }
 
-TEST_F(OptimizerManagerTest, CheckpointLruAdmissionProtectsReadHitCheckpointAndRejectsWhenFull) {
+TEST_F(OptimizerManagerTest, CheckpointLruAdmissionRewritesPrefixEvictedDuringSameRequest) {
     auto config = CreateTestOptimizerConfig();
     config.set_trace_file_path(GetTestTempRootPath() + "/checkpoint_lru_rewrite_evicted_prefix.jsonl");
     config.set_output_result_path(GetTestTempRootPath() + "/checkpoint_lru_rewrite_evicted_prefix_result");
@@ -597,18 +597,13 @@ TEST_F(OptimizerManagerTest, CheckpointLruAdmissionProtectsReadHitCheckpointAndR
     auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
         manager.eviction_manager_->GetSharedPolicy("instance1"));
     ASSERT_NE(policy, nullptr);
-    EXPECT_EQ(policy->size(), 3);
+    EXPECT_EQ(policy->size(), 4);
     EXPECT_EQ(policy->checkpoint_count(), 1);
 
     BlockMask branch_mask = std::vector<bool>{false, false, false};
     auto branch_hit =
-        manager.GetCacheLocation("instance1", "read_branch_after_reject", 3000, {1, 2, 9}, branch_mask, 3);
-    EXPECT_EQ(branch_hit.kvcm_hit_length, 2);
-
-    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
-    ASSERT_NE(last_read, nullptr);
-    EXPECT_EQ(last_read->mamba_state_candidate_blocks, 2);
-    EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
+        manager.GetCacheLocation("instance1", "read_branch_after_rewrite", 3000, {1, 2, 9}, branch_mask, 3);
+    EXPECT_EQ(branch_hit.kvcm_hit_length, 3);
 }
 
 TEST_F(OptimizerManagerTest, CheckpointLruRejectsCheckpointLargerThanCapacity) {

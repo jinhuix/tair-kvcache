@@ -184,20 +184,6 @@ bool CheckpointLruEvictionPolicy::TouchCheckpoint(uint64_t checkpoint_id, int64_
     return true;
 }
 
-void CheckpointLruEvictionPolicy::SetProtectedCheckpointsForAdmission(
-    const std::vector<uint64_t> &checkpoint_ids) {
-    protected_checkpoints_for_admission_.clear();
-    for (const uint64_t checkpoint_id : checkpoint_ids) {
-        if (checkpoint_id != 0 && checkpoints_.count(checkpoint_id) != 0) {
-            protected_checkpoints_for_admission_.insert(checkpoint_id);
-        }
-    }
-}
-
-void CheckpointLruEvictionPolicy::ClearProtectedCheckpointsForAdmission() {
-    protected_checkpoints_for_admission_.clear();
-}
-
 void CheckpointLruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     auto it = mamba_to_checkpoint_.find(block);
     if (it != mamba_to_checkpoint_.end()) {
@@ -325,9 +311,6 @@ uint64_t CheckpointLruEvictionPolicy::SelectLowestScoreCheckpoint() const {
     double selected_score = std::numeric_limits<double>::infinity();
     int64_t selected_last_access = std::numeric_limits<int64_t>::max();
     for (const auto &[checkpoint_id, record] : checkpoints_) {
-        if (protected_checkpoints_for_admission_.count(checkpoint_id) != 0) {
-            continue;
-        }
         const double score = CheckpointScore(checkpoint_id, record);
         if (selected == 0 || score < selected_score ||
             (score == selected_score &&
@@ -352,11 +335,6 @@ std::vector<BlockEntry *> CheckpointLruEvictionPolicy::EvictBlocks(size_t count)
     while (evicted.size() < count && !checkpoint_lru_.empty()) {
         const uint64_t victim = SelectLowestScoreCheckpoint();
         if (victim == 0) {
-            if (!protected_checkpoints_for_admission_.empty()) {
-                KVCM_LOG_DEBUG("checkpoint_lru admission eviction stopped because all remaining checkpoints are "
-                               "protected count=%zu protected=%zu requested=%zu evicted=%zu",
-                               checkpoints_.size(), protected_checkpoints_for_admission_.size(), count, evicted.size());
-            }
             break;
         }
         DetachCheckpoint(victim, &evicted);
@@ -397,7 +375,6 @@ void CheckpointLruEvictionPolicy::Clear() {
     checkpoints_.clear();
     mamba_to_checkpoint_.clear();
     full_boundary_to_checkpoint_.clear();
-    protected_checkpoints_for_admission_.clear();
 }
 
 } // namespace kv_cache_manager

@@ -45,6 +45,7 @@ public:
     OptEvictionManager::EvictionResult CheckAndEvictForAdmission(const std::string &instance_id,
                                                                  size_t admission_blocks,
                                                                  int64_t eviction_timestamp = 0);
+    bool CanFitAdmission(const std::string &instance_id, size_t admission_blocks) const;
 
     // 统一清理驱逐后的 block，并触发节点清理
     void CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,

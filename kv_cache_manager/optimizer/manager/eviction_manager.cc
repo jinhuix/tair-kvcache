@@ -24,6 +24,15 @@ bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
     return true;
 }
 
+std::shared_ptr<EvictionPolicy> OptEvictionManager::GetSharedPolicy(const std::string &instance_id) const {
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end() || it->second.policies.size() != 1 ||
+        it->second.shared_policy()->name() != "shared") {
+        return nullptr;
+    }
+    return it->second.shared_policy();
+}
+
 TieredPolicyGroup *
 OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
                                                     const std::vector<OptTierConfig> &storage_configs,

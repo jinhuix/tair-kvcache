@@ -13,6 +13,7 @@ enum class EvictionPolicyType {
     POLICY_LEAF_AWARE_LRU = 3,
     POLICY_TTL = 4,
     POLICY_PROMOTE_LRU = 5,
+    POLICY_CHECKPOINT_LRU = 6,
 };
 enum class EvictionMode {
     EVICTION_MODE_UNSPECIFIED = 0,
@@ -58,6 +59,11 @@ struct BlockEntry {
     size_t access_count = 0;
     int64_t ttl_ns = 0;                  // TTL 纳秒，0 = 永不过期
     RadixTreeNode *owner_node = nullptr; // 所属节点指针
+    // 同一路径上的前一个 full-attention block。Radix tree split 只移动
+    // unique_ptr，不改变 BlockEntry 地址，因此该链在节点拆分后仍然稳定。
+    BlockEntry *prefix_parent = nullptr;
+    // 被多少个 resident Mamba checkpoint 依赖。仅 checkpoint_lru 使用。
+    size_t checkpoint_ref_count = 0;
 
     void ResetAccess() {
         access_count = 0;
@@ -65,6 +71,7 @@ struct BlockEntry {
         ttl_anchor_time = -1;
         writing_time = -1;
         ttl_ns = 0;
+        checkpoint_ref_count = 0;
     }
 
     bool IsExpired(int64_t current_timestamp) const {

@@ -513,6 +513,56 @@ std::vector<int64_t> RadixTreeIndex::PrefixPathForBlock(const BlockEntry *block)
     return path;
 }
 
+BlockEntry *RadixTreeIndex::FindPathBlock(const std::vector<int64_t> &block_keys, size_t block_index) const {
+    if (block_index >= block_keys.size()) {
+        return nullptr;
+    }
+    const RadixTreeNode *node = root_.get();
+    size_t key_offset = 0;
+    while (key_offset <= block_index) {
+        auto child_it = node->children.find(block_keys[key_offset]);
+        if (child_it == node->children.end()) {
+            return nullptr;
+        }
+        const RadixTreeNode *child = child_it->second.get();
+        for (size_t i = 0; i < child->blocks.size() && key_offset + i <= block_index; ++i) {
+            if (child->blocks[i] == nullptr || child->blocks[i]->key != block_keys[key_offset + i]) {
+                return nullptr;
+            }
+            if (key_offset + i == block_index) {
+                return child->blocks[i].get();
+            }
+        }
+        key_offset += child->blocks.size();
+        node = child;
+    }
+    return nullptr;
+}
+
+size_t RadixTreeIndex::CountMissingPathBlocks(const std::vector<int64_t> &block_keys,
+                                              const std::vector<size_t> *materialized_indices,
+                                              const std::string &tier_name) const {
+    std::vector<bool> selected(block_keys.size(), materialized_indices == nullptr);
+    if (materialized_indices != nullptr) {
+        for (const size_t idx : *materialized_indices) {
+            if (idx < selected.size()) {
+                selected[idx] = true;
+            }
+        }
+    }
+    size_t missing = 0;
+    for (size_t idx = 0; idx < block_keys.size(); ++idx) {
+        if (!selected[idx]) {
+            continue;
+        }
+        BlockEntry *block = FindPathBlock(block_keys, idx);
+        if (block == nullptr || block->location_map.count(tier_name) == 0) {
+            ++missing;
+        }
+    }
+    return missing;
+}
+
 void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                                       int64_t eviction_timestamp,
                                       bool use_logical_expire_time) {
@@ -587,10 +637,23 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendPathBlocks(RadixTreeNode *node,
                                                            size_t materialized_offset) {
     std::vector<BlockEntry *> inserted_blocks;
     inserted_blocks.reserve(block_keys.size());
+    BlockEntry *previous = nullptr;
+    if (!node->blocks.empty()) {
+        previous = node->blocks.back().get();
+    } else {
+        RadixTreeNode *ancestor = node->parent;
+        while (ancestor != nullptr && ancestor->blocks.empty()) {
+            ancestor = ancestor->parent;
+        }
+        if (ancestor != nullptr && !ancestor->blocks.empty()) {
+            previous = ancestor->blocks.back().get();
+        }
+    }
     for (size_t i = 0; i < block_keys.size(); ++i) {
         auto entry = std::make_unique<BlockEntry>();
         entry->key = block_keys[i];
         entry->owner_node = node;
+        entry->prefix_parent = previous;
         BlockEntry *entry_ptr = entry.get();
         if (ShouldMaterializeBlock(materialized_blocks, materialized_offset + i)) {
             block_index_[entry_ptr->key] = entry_ptr;
@@ -602,6 +665,7 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendPathBlocks(RadixTreeNode *node,
             }
         }
         node->blocks.emplace_back(std::move(entry));
+        previous = entry_ptr;
     }
     return inserted_blocks;
 }

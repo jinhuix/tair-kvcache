@@ -94,6 +94,7 @@ public:
                             BlockEntry *block,
                             int64_t timestamp,
                             bool refresh_ttl_on_read = true);
+    std::shared_ptr<EvictionPolicy> GetSharedPolicy(const std::string &instance_id) const;
 
     // 级联降级：将 blocks 复制到 tier_{next_idx} 的 location_map + LRU 队列
     void DemoteToNextTier(const std::string &instance_id,

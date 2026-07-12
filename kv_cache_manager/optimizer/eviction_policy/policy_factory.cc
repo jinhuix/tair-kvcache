@@ -3,6 +3,7 @@
 #include <variant>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/optimizer/eviction_policy/checkpoint_lru.h"
 
 namespace kv_cache_manager {
 std::shared_ptr<EvictionPolicy> EvictionPolicyFactory::CreatePolicy(EvictionPolicyType type,
@@ -58,6 +59,13 @@ std::shared_ptr<EvictionPolicy> EvictionPolicyFactory::CreatePolicy(EvictionPoli
                       name.c_str(),
                       promote_lru_params.enabled_tiers.size());
         return std::make_shared<PromoteLruEvictionPolicy>(name, promote_lru_params);
+    }
+    case EvictionPolicyType::POLICY_CHECKPOINT_LRU: {
+        if (!std::holds_alternative<CheckpointLruParams>(param)) {
+            KVCM_LOG_ERROR("Invalid parameters for Checkpoint LRU eviction policy on tier %s", name.c_str());
+            return nullptr;
+        }
+        return std::make_shared<CheckpointLruEvictionPolicy>(name, std::get<CheckpointLruParams>(param));
     }
     case EvictionPolicyType::POLICY_UNSPECIFIED:
     default:

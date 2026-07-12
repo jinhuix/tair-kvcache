@@ -89,6 +89,10 @@ public:
 
     const std::vector<std::string> &GetTierNames() const { return tier_names_; }
     std::vector<int64_t> PrefixPathForBlock(const BlockEntry *block) const;
+    BlockEntry *FindPathBlock(const std::vector<int64_t> &block_keys, size_t block_index) const;
+    size_t CountMissingPathBlocks(const std::vector<int64_t> &block_keys,
+                                  const std::vector<size_t> *materialized_indices,
+                                  const std::string &tier_name) const;
 
     // 导出前缀树用于可视化
     struct RadixTreeExportNode {

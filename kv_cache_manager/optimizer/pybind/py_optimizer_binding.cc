@@ -44,6 +44,7 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .value("RANDOM_LRU", kvcm::EvictionPolicyType::POLICY_RANDOM_LRU)
         .value("LEAF_AWARE_LRU", kvcm::EvictionPolicyType::POLICY_LEAF_AWARE_LRU)
         .value("TTL", kvcm::EvictionPolicyType::POLICY_TTL)
+        .value("CHECKPOINT_LRU", kvcm::EvictionPolicyType::POLICY_CHECKPOINT_LRU)
         .finalize();
 
     py::native_enum<kvcm::DataStorageType>(module, "DataStorageType", "enum.Enum")

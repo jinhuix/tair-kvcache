@@ -10,6 +10,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
+#include "kv_cache_manager/optimizer/eviction_policy/checkpoint_lru.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_loader.h"
 
 namespace kv_cache_manager {
@@ -130,6 +131,7 @@ void OptimizerRunner::ResetReplayState(bool clear_mamba_state) {
     if (clear_mamba_state) {
         ClearAllMambaStates();
         next_mamba_state_sequence_ = 0;
+        next_mamba_checkpoint_id_ = 1;
     }
 }
 
@@ -478,6 +480,45 @@ bool OptimizerRunner::MambaCheckpointIsResident(const MambaCheckpointRecord &rec
     return true;
 }
 
+CheckpointLruEvictionPolicy *OptimizerRunner::GetCheckpointLruPolicy(const std::string &instance_id) const {
+    auto policy = eviction_manager_->GetSharedPolicy(instance_id);
+    return dynamic_cast<CheckpointLruEvictionPolicy *>(policy.get());
+}
+
+bool OptimizerRunner::RegisterCheckpointWithEvictionPolicy(const std::string &instance_id,
+                                                           const std::vector<int64_t> &keys,
+                                                           size_t checkpoint_index,
+                                                           MambaCheckpointRecord *record,
+                                                           int64_t timestamp_ns) {
+    auto *policy = GetCheckpointLruPolicy(instance_id);
+    if (policy == nullptr) {
+        return true;
+    }
+    if (record == nullptr || checkpoint_index >= keys.size()) {
+        return false;
+    }
+    if (record->eviction_id == 0) {
+        record->eviction_id = next_mamba_checkpoint_id_++;
+    }
+    if (policy->HasCheckpoint(record->eviction_id)) {
+        return policy->TouchCheckpoint(record->eviction_id, timestamp_ns);
+    }
+
+    auto indexer = GetIndexer(instance_id);
+    if (!indexer) {
+        return false;
+    }
+    BlockEntry *boundary = indexer->FindPathBlock(keys, checkpoint_index);
+    std::vector<BlockEntry *> objects;
+    objects.reserve(record->objects.size());
+    for (const auto &object : record->objects) {
+        if (object != nullptr) {
+            objects.push_back(object.get());
+        }
+    }
+    return policy->RegisterCheckpoint(record->eviction_id, boundary, objects, timestamp_ns);
+}
+
 bool OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
                                                const PrefixSignature &signature,
                                                size_t group_slot,
@@ -760,6 +801,9 @@ std::pair<size_t, size_t> OptimizerRunner::ApplyMambaStateRead(const std::string
             hit_blocks = prefix_len;
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+            if (auto *policy = GetCheckpointLruPolicy(instance_id); policy != nullptr) {
+                policy->TouchCheckpoint(checkpoint_it->second.eviction_id, timestamp_ns);
+            }
             TouchMambaCheckpointObjects(instance_id, &checkpoint_it->second, timestamp_ns);
             break;
         }
@@ -824,6 +868,7 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
             checkpoint_it =
                 checkpoints.emplace(signatures[idx + 1], MambaCheckpointRecord{timestamp_ns, next_mamba_state_sequence_++})
                     .first;
+            checkpoint_it->second.eviction_id = next_mamba_checkpoint_id_++;
         }
 
         if (UsesSharedMambaCapacity()) {
@@ -834,6 +879,10 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
             }
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
+            if (!RegisterCheckpointWithEvictionPolicy(
+                    instance_id, keys, idx, &checkpoint_it->second, timestamp_ns)) {
+                throw std::runtime_error("failed to register complete Mamba checkpoint with checkpoint_lru");
+            }
             if (registered_new_object && is_historical_branch_prefix(signatures[idx + 1])) {
                 TouchMambaCheckpointObjects(instance_id, &checkpoint_it->second, timestamp_ns);
                 TouchMambaBranchPrefixOnAdmission(instance_id, keys, checkpoint_prefix_blocks, timestamp_ns);
@@ -923,25 +972,44 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
         TouchMambaBranchPrefixOnAdmission(instance_id, trace.keys(), branch_prefix_touch_blocks, trace.timestamp_ns());
     }
 
-    const size_t admission_reserved_blocks =
-        CountMaterializedBlocks(trace.keys().size(), effective_materialized_indices) +
-        EstimateMambaStateAdmissionObjects(instance_id, trace.keys(), effective_materialized_indices, mamba_hit_blocks);
-    auto admission_eviction =
-        indexer_manager_->CheckAndEvictForAdmission(instance_id, admission_reserved_blocks, trace.timestamp_ns());
-    HandleMambaStateEvictions(&admission_eviction.evicted_blocks);
-    MergeEvictedBlocks(&pending_evicted_blocks, admission_eviction.evicted_blocks);
-    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
-    pending_evicted_blocks.clear();
+    auto *checkpoint_policy = GetCheckpointLruPolicy(instance_id);
+    const auto compute_admission_blocks = [&]() {
+        const size_t full_blocks = checkpoint_policy == nullptr
+                                       ? CountMaterializedBlocks(trace.keys().size(), effective_materialized_indices)
+                                       : indexer->CountMissingPathBlocks(
+                                             trace.keys(), effective_materialized_indices, "shared");
+        return full_blocks + EstimateMambaStateAdmissionObjects(
+                                 instance_id, trace.keys(), effective_materialized_indices, mamba_hit_blocks);
+    };
 
-    RadixTreeIndex::InsertResult result;
-    if (count_new_tier_write_touch && effective_materialized_indices == nullptr) {
-        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
-    } else if (effective_materialized_indices != nullptr) {
-        result =
-            indexer->FillPathOnly(trace.keys(), *effective_materialized_indices, trace.timestamp_ns(), effective_ttl_ns);
-    } else {
-        throw std::runtime_error("HandleCacheInsert fill requires materialized indices");
+    size_t admission_reserved_blocks = compute_admission_blocks();
+    bool admission_fits = false;
+    while (true) {
+        const size_t size_before = checkpoint_policy == nullptr ? 0 : checkpoint_policy->size();
+        auto admission_eviction =
+            indexer_manager_->CheckAndEvictForAdmission(instance_id, admission_reserved_blocks, trace.timestamp_ns());
+        HandleMambaStateEvictions(&admission_eviction.evicted_blocks);
+        MergeEvictedBlocks(&pending_evicted_blocks, admission_eviction.evicted_blocks);
+        indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
+        pending_evicted_blocks.clear();
+
+        if (checkpoint_policy == nullptr) {
+            admission_fits = true; // Preserve the behavior of existing policies.
+            break;
+        }
+        // Atomic eviction may remove a checkpoint that supplied blocks on the
+        // incoming path. Recompute the exact missing footprint and repeat until
+        // either it fits or no further resident object can be reclaimed.
+        admission_reserved_blocks = compute_admission_blocks();
+        if (indexer_manager_->CanFitAdmission(instance_id, admission_reserved_blocks)) {
+            admission_fits = true;
+            break;
+        }
+        if (checkpoint_policy->size() >= size_before) {
+            break;
+        }
     }
+
     size_t write_blocks = trace.keys().size();
     if (effective_materialized_indices != nullptr) {
         std::vector<bool> selected(trace.keys().size(), false);
@@ -953,6 +1021,27 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
         write_blocks = std::count(selected.begin(), selected.end(), true);
     }
     record.write_blocks = write_blocks;
+
+    if (!admission_fits) {
+        // A checkpoint is indivisible. If its complete incremental footprint
+        // cannot fit even after reclaiming everything, reject this cache write
+        // instead of creating an over-capacity or partially resident checkpoint.
+        ObserveMambaBranchPrefixes(instance_id, BuildPrefixSignatures(trace.keys()));
+        if (count_new_tier_write_touch) {
+            stats_collector_->OnWriteComplete(instance_id, record);
+        }
+        return record;
+    }
+
+    RadixTreeIndex::InsertResult result;
+    if (count_new_tier_write_touch && effective_materialized_indices == nullptr) {
+        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
+    } else if (effective_materialized_indices != nullptr) {
+        result =
+            indexer->FillPathOnly(trace.keys(), *effective_materialized_indices, trace.timestamp_ns(), effective_ttl_ns);
+    } else {
+        throw std::runtime_error("HandleCacheInsert fill requires materialized indices");
+    }
     record.newly_inserted_blocks = result.inserted_keys.size();
     ApplyMambaStateWrite(instance_id, trace.keys(), trace.timestamp_ns(), nullptr, mamba_hit_blocks);
     if (count_new_tier_write_touch) {

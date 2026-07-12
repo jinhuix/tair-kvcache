@@ -84,7 +84,20 @@ struct PromoteLruParams : public Jsonizable {
     }
 };
 
-using EvictionPolicyParam = std::variant<LruParams, RandomLruParams, TtlParams, PromoteLruParams>;
+struct CheckpointLruParams : public Jsonizable {
+    bool evict_unreferenced_full_blocks_first = true;
+    bool FromRapidValue(const rapidjson::Value &v) override {
+        KVCM_JSON_GET_DEFAULT_MACRO(
+            v, "evict_unreferenced_full_blocks_first", evict_unreferenced_full_blocks_first, true);
+        return true;
+    }
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "evict_unreferenced_full_blocks_first", evict_unreferenced_full_blocks_first);
+    }
+};
+
+using EvictionPolicyParam =
+    std::variant<LruParams, RandomLruParams, TtlParams, PromoteLruParams, CheckpointLruParams>;
 
 class EvictionConfig : public Jsonizable {
 public:

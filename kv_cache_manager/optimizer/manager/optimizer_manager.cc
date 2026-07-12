@@ -94,6 +94,30 @@ bool OptimizerManager::Init() {
             auto instance_config = instance;
             auto instance_id = instance_config.instance_id();
 
+            if (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_CHECKPOINT_LRU) {
+                if (!config_.mamba_state_config().enabled()) {
+                    KVCM_LOG_ERROR("checkpoint_lru requires mamba_state.enabled=true for instance %s",
+                                   instance_id.c_str());
+                    failed_instances++;
+                    failed_instance_ids.push_back(instance_id);
+                    continue;
+                }
+                if (group.hierarchical_eviction_enabled()) {
+                    KVCM_LOG_ERROR("checkpoint_lru currently supports only non-hierarchical shared capacity: %s",
+                                   instance_id.c_str());
+                    failed_instances++;
+                    failed_instance_ids.push_back(instance_id);
+                    continue;
+                }
+                if (config_.mamba_state_config().max_resident_checkpoints() != 0) {
+                    KVCM_LOG_ERROR("checkpoint_lru cannot be combined with max_resident_checkpoints: %s",
+                                   instance_id.c_str());
+                    failed_instances++;
+                    failed_instance_ids.push_back(instance_id);
+                    continue;
+                }
+            }
+
             if (instance_configs_.find(instance_id) != instance_configs_.end()) {
                 KVCM_LOG_WARN("Duplicate instance_id found: %s", instance_id.c_str());
                 continue;

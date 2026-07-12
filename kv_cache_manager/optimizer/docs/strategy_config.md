@@ -334,7 +334,7 @@ Write trace：
 | `instance_id` | string | trace 中的实例 ID，必须与 trace 行内 `instance_id` 匹配 |
 | `block_size` | int | 每个 block 的 token 数。token hit rate 会用它把命中 block 转为命中 token |
 | `bytes_per_token` | int | 单 token KV 大小。`bytes_per_block = block_size * bytes_per_token` |
-| `eviction_policy_type` | string | `lru`、`random_lru`、`leaf_aware_lru`、`ttl` |
+| `eviction_policy_type` | string | `lru`、`random_lru`、`leaf_aware_lru`、`ttl`、`promote_lru`、`checkpoint_lru` |
 | `eviction_policy_params` | object | 策略参数，见下文 |
 
 ## eviction_policy_params
@@ -381,6 +381,35 @@ Write trace：
 | `fallback_on_pressure=false` | 纯 TTL，只清理过期 block；容量压力不会触发 LRU 兜底 |
 
 TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `default_block_ttl_seconds` 和 `ttl_refresh_on_read` 的过期清理语义。
+
+### checkpoint_lru
+
+`checkpoint_lru` 用于 full-attention + Mamba 混合模型，通常和 `branch_end` checkpoint 一起使用：
+
+```json
+{
+  "mamba_state": {
+    "enabled": true,
+    "checkpoint_strategy": "branch",
+    "branch_save_request_end_checkpoint": true,
+    "group_count": 12,
+    "max_resident_checkpoints": 0
+  },
+  "instance_groups": [{
+    "tier_strategy": {"hierarchical_eviction_enabled": false},
+    "instances": [{
+      "eviction_policy_type": "checkpoint_lru",
+      "eviction_policy_params": {
+        "evict_unreferenced_full_blocks_first": true
+      }
+    }]
+  }]
+}
+```
+
+该策略以完整 checkpoint 为 LRU 单元：一次淘汰会原子删除该 checkpoint 的所有 Mamba group，并删除不再被其他 resident checkpoint 引用的 full-prefix block。多个 checkpoint 的公共 full prefix 通过引用计数共享。推理写入仍会保存请求实际计算出的全部 full KV；尚未被 checkpoint 引用的 tail 会先保留，在容量压力出现时优先回收。
+
+当前约束：只支持非分层 `shared` capacity；必须启用 `mamba_state`；不能同时设置 `max_resident_checkpoints`。单个完整 checkpoint 的增量 footprint 大于总容量时，整次 admission 会被拒绝，不会产生部分 Mamba checkpoint。
 
 ## 标准多实例回放
 

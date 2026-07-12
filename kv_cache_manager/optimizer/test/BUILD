@@ -1,6 +1,17 @@
 package(default_visibility = ["//visibility:private"])
 
 cc_test(
+    name = "CheckpointLruEvictionPolicyTest",
+    srcs = ["checkpoint_lru_eviction_policy_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/eviction_policy",
+    ],
+)
+
+cc_test(
     name = "PromoteLruEvictionPolicyTest",
     srcs = [
         "promote_lru_eviction_policy_test.cc",

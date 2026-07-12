@@ -9,6 +9,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
+#include "kv_cache_manager/optimizer/eviction_policy/checkpoint_lru.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 
 using namespace kv_cache_manager;
@@ -426,6 +427,164 @@ TEST_F(OptimizerManagerTest, PromoteLruHotAdmitsBranchCheckpointAndPrefix) {
     ASSERT_NE(last_read, nullptr);
     EXPECT_EQ(last_read->mamba_state_candidate_blocks, 3);
     EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
+}
+
+TEST_F(OptimizerManagerTest, CheckpointLruBranchEndEvictsWholeCheckpointUnderCapacityPressure) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_branch_save_request_end_checkpoint(true);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(4);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_CHECKPOINT_LRU);
+    instances[0].set_eviction_policy_param(CheckpointLruParams{});
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.WriteCache("instance1", "write_a", 1000, {1, 2});
+
+    auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
+        manager.eviction_manager_->GetSharedPolicy("instance1"));
+    ASSERT_NE(policy, nullptr);
+    EXPECT_EQ(policy->size(), 4);
+    EXPECT_EQ(policy->checkpoint_count(), 1);
+
+    // Admission of B requires four blocks. A must be removed as one unit:
+    // two full blocks plus both Mamba groups.
+    manager.WriteCache("instance1", "write_b", 2000, {10, 11});
+    EXPECT_EQ(policy->size(), 4);
+    EXPECT_EQ(policy->checkpoint_count(), 1);
+
+    BlockMask mask = std::vector<bool>{false, false};
+    auto old_result = manager.GetCacheLocation("instance1", "read_a", 3000, {1, 2}, mask, 2);
+    EXPECT_EQ(old_result.kvcm_hit_length, 0);
+    auto new_result = manager.GetCacheLocation("instance1", "read_b", 4000, {10, 11}, mask, 2);
+    EXPECT_EQ(new_result.kvcm_hit_length, 2);
+}
+
+TEST_F(OptimizerManagerTest, CheckpointLruBranchWriteKeepsTailUntilCapacityPressure) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    auto group = groups[0];
+    group.set_quota_capacity(3);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_CHECKPOINT_LRU);
+    instances[0].set_eviction_policy_param(CheckpointLruParams{});
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.WriteCache("instance1", "first_branch_observation", 1000, {1, 2, 3});
+
+    auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
+        manager.eviction_manager_->GetSharedPolicy("instance1"));
+    ASSERT_NE(policy, nullptr);
+    EXPECT_EQ(policy->size(), 3);
+    EXPECT_EQ(policy->checkpoint_count(), 0);
+    EXPECT_EQ(policy->unreferenced_full_block_count(), 3);
+
+    // The engine-computed tail was retained. A later write creates pressure,
+    // at which point currently unmatchable full blocks are reclaimed first.
+    manager.WriteCache("instance1", "pressure", 2000, {10});
+    EXPECT_EQ(policy->size(), 3);
+    EXPECT_EQ(policy->unreferenced_full_block_count(), 3);
+}
+
+TEST_F(OptimizerManagerTest, CheckpointLruBranchEndSharesPrefixAndReservesOnlyMissingBlocks) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_branch_save_request_end_checkpoint(true);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto group = config.instance_groups()[0];
+    group.set_quota_capacity(7);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_CHECKPOINT_LRU);
+    instances[0].set_eviction_policy_param(CheckpointLruParams{});
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.WriteCache("instance1", "first", 1000, {1, 2, 3});
+    manager.WriteCache("instance1", "branch", 2000, {1, 2, 9});
+
+    auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
+        manager.eviction_manager_->GetSharedPolicy("instance1"));
+    ASSERT_NE(policy, nullptr);
+    // full={1,2,3,9}; checkpoints={first end, shared branch, second end}.
+    EXPECT_EQ(policy->size(), 7);
+    EXPECT_EQ(policy->checkpoint_count(), 3);
+
+    BlockMask mask3 = std::vector<bool>{false, false, false};
+    EXPECT_EQ(manager.GetCacheLocation("instance1", "read_first", 3000, {1, 2, 3}, mask3, 3).kvcm_hit_length, 3);
+    EXPECT_EQ(manager.GetCacheLocation("instance1", "read_branch", 4000, {1, 2, 9}, mask3, 3).kvcm_hit_length, 3);
+}
+
+TEST_F(OptimizerManagerTest, CheckpointLruRejectsCheckpointLargerThanCapacity) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_branch_save_request_end_checkpoint(true);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto group = config.instance_groups()[0];
+    group.set_quota_capacity(3); // request needs 2 full + 2 Mamba blocks
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_CHECKPOINT_LRU);
+    instances[0].set_eviction_policy_param(CheckpointLruParams{});
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.WriteCache("instance1", "too_large", 1000, {1, 2});
+
+    auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
+        manager.eviction_manager_->GetSharedPolicy("instance1"));
+    ASSERT_NE(policy, nullptr);
+    EXPECT_EQ(policy->size(), 0);
+    EXPECT_EQ(policy->checkpoint_count(), 0);
+    BlockMask mask = std::vector<bool>{false, false};
+    EXPECT_EQ(manager.GetCacheLocation("instance1", "miss", 2000, {1, 2}, mask, 2).kvcm_hit_length, 0);
 }
 
 TEST_F(OptimizerManagerTest, DirectRunTraceFilePreservesMambaStateAcrossWarmupReset) {

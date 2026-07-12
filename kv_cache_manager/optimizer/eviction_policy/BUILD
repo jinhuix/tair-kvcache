@@ -3,6 +3,7 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "eviction_policy",
     srcs = [
+        "checkpoint_lru.cc",
         "lru.cc",
         "promote_lru.cc",
         "random_lru.cc",
@@ -12,6 +13,7 @@ cc_library(
     ],
     hdrs = [
         "base.h",
+        "checkpoint_lru.h",
         "common_structure.h",
         "policy_factory.h",
         "lru.h",

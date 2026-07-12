@@ -15,6 +15,7 @@
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
+class CheckpointLruEvictionPolicy;
 class OptimizerRunner {
 public:
     explicit OptimizerRunner(const std::shared_ptr<OptIndexerManager> &indexer_manager,
@@ -74,6 +75,7 @@ private:
     struct MambaCheckpointRecord {
         int64_t last_access_ns = 0;
         uint64_t sequence = 0;
+        uint64_t eviction_id = 0;
         std::vector<std::unique_ptr<BlockEntry>> objects;
     };
 
@@ -111,6 +113,12 @@ private:
     bool UsesSharedMambaCapacity() const;
     size_t MambaCheckpointObjectCount(const MambaCheckpointRecord &record) const;
     bool MambaCheckpointIsResident(const MambaCheckpointRecord &record) const;
+    CheckpointLruEvictionPolicy *GetCheckpointLruPolicy(const std::string &instance_id) const;
+    bool RegisterCheckpointWithEvictionPolicy(const std::string &instance_id,
+                                              const std::vector<int64_t> &keys,
+                                              size_t checkpoint_index,
+                                              MambaCheckpointRecord *record,
+                                              int64_t timestamp_ns);
     bool RegisterMambaStateObject(const std::string &instance_id,
                                   const PrefixSignature &signature,
                                   size_t group_slot,
@@ -177,6 +185,7 @@ private:
     int64_t write_delay_ns_ = 1;
     uint64_t next_pending_write_sequence_ = 0;
     uint64_t next_mamba_state_sequence_ = 0;
+    uint64_t next_mamba_checkpoint_id_ = 1;
     std::priority_queue<PendingWrite, std::vector<PendingWrite>, PendingWriteCompare> pending_writes_;
 };
 } // namespace kv_cache_manager

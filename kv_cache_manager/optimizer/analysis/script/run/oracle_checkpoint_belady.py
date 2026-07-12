@@ -424,21 +424,24 @@ def main() -> None:
     )
 
     summary_path = args.output_dir / "summary.csv"
+    if summary_path.exists():
+        summary_path.unlink()
+    status_path = args.output_dir / "status.json"
+    if status_path.exists():
+        status_path.unlink()
     completed: list[dict] = []
     if args.capacities_tib:
         capacities = list(args.capacities_tib)
     else:
-        capacities = []
-        cap = args.start_capacity_tib
-        while True:
-            capacities.append(cap)
-            if args.max_capacity_tib > 0 and cap >= args.max_capacity_tib:
-                break
-            cap *= args.growth_factor
-            if args.max_capacity_tib <= 0 and len(capacities) > 64:
-                raise RuntimeError("refusing to run more than 64 growth steps without reaching target")
+        capacities = None
 
-    for capacity_tib in capacities:
+    capacity_tib = args.start_capacity_tib
+    run_count = 0
+    while True:
+        if capacities is not None:
+            if run_count >= len(capacities):
+                break
+            capacity_tib = capacities[run_count]
         capacity_blocks = capacity_blocks_from_tib(capacity_tib)
         print(f"[{now()}] start oracle capacity={capacity_tib}T blocks={capacity_blocks}", flush=True)
         metrics = oracle.run_capacity(capacity_blocks, args.warmup_ns)
@@ -452,7 +455,7 @@ def main() -> None:
         }
         append_summary(summary_path, row)
         completed.append(row)
-        (args.output_dir / "status.json").write_text(
+        status_path.write_text(
             json.dumps(
                 {
                     "state": "done" if reached else "running",
@@ -472,6 +475,13 @@ def main() -> None:
         )
         if reached and not args.capacities_tib:
             break
+        run_count += 1
+        if capacities is None:
+            if args.max_capacity_tib > 0 and capacity_tib >= args.max_capacity_tib:
+                break
+            if run_count >= 64:
+                raise RuntimeError("refusing to run more than 64 growth steps without reaching target")
+            capacity_tib *= args.growth_factor
 
     print(f"[{now()}] oracle summary={summary_path}", flush=True)
 

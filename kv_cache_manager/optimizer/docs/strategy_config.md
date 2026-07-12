@@ -400,14 +400,33 @@ TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `def
     "instances": [{
       "eviction_policy_type": "checkpoint_lru",
       "eviction_policy_params": {
-        "evict_unreferenced_full_blocks_first": true
+        "evict_unreferenced_full_blocks_first": true,
+        "score_alpha": 0.25,
+        "score_min_interval_seconds": 30.0,
+        "score_first_hit_interval_seconds": 399.0,
+        "score_initial_hotness": 0.02,
+        "score_max_hotness": 4.0
       }
     }]
   }]
 }
 ```
 
-该策略以完整 checkpoint 为 LRU 单元：一次淘汰会原子删除该 checkpoint 的所有 Mamba group，并删除不再被其他 resident checkpoint 引用的 full-prefix block。多个 checkpoint 的公共 full prefix 通过引用计数共享。推理写入仍会保存请求实际计算出的全部 full KV；尚未被 checkpoint 引用的 tail 会先保留，在容量压力出现时优先回收。
+该策略以完整 checkpoint 为淘汰单元：一次淘汰会原子删除该 checkpoint 的所有 Mamba group，并删除不再被其他 resident checkpoint 引用的 full-prefix block。多个 checkpoint 的公共 full prefix 通过引用计数共享。推理写入仍会保存请求实际计算出的全部 full KV；尚未被 checkpoint 引用的 tail 会先保留，在容量压力出现时优先回收。
+
+checkpoint victim 按最低分淘汰：
+
+```text
+interval_min = max((now - last_hit_time) / 60s, score_min_interval_seconds / 60s)
+instant_hotness = 1 / interval_min
+hotness = min(score_max_hotness, (1 - score_alpha) * old_hotness + score_alpha * instant_hotness)
+
+m = max(1, checkpoint_prefix_blocks - fallback_prefix_blocks)
+c = max(1, mamba_group_objects + exclusive_full_prefix_blocks)
+score = log1p(m / c) * hotness
+```
+
+其中 `fallback_prefix_blocks` 是删除该 checkpoint 后能回退到的最近 resident 父 checkpoint 长度；`exclusive_full_prefix_blocks` 是删除该 checkpoint 时实际会释放的独占 full-prefix block 数。`score_first_hit_interval_seconds` 用于第一次命中时初始化瞬时热度，默认 399 秒，对应 qwen3.7 trace 中连续命中间隔约 p95。
 
 当前约束：只支持非分层 `shared` capacity；必须启用 `mamba_state`；不能同时设置 `max_resident_checkpoints`。单个完整 checkpoint 的增量 footprint 大于总容量时，整次 admission 会被拒绝，不会产生部分 Mamba checkpoint。
 

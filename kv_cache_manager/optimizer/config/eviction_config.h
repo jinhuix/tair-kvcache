@@ -86,13 +86,28 @@ struct PromoteLruParams : public Jsonizable {
 
 struct CheckpointLruParams : public Jsonizable {
     bool evict_unreferenced_full_blocks_first = true;
+    double score_alpha = 0.25;
+    double score_min_interval_seconds = 30.0;
+    double score_first_hit_interval_seconds = 399.0;
+    double score_initial_hotness = 0.02;
+    double score_max_hotness = 4.0;
     bool FromRapidValue(const rapidjson::Value &v) override {
         KVCM_JSON_GET_DEFAULT_MACRO(
             v, "evict_unreferenced_full_blocks_first", evict_unreferenced_full_blocks_first, true);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "score_alpha", score_alpha, 0.25);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "score_min_interval_seconds", score_min_interval_seconds, 30.0);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "score_first_hit_interval_seconds", score_first_hit_interval_seconds, 399.0);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "score_initial_hotness", score_initial_hotness, 0.02);
+        KVCM_JSON_GET_DEFAULT_MACRO(v, "score_max_hotness", score_max_hotness, 4.0);
         return true;
     }
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "evict_unreferenced_full_blocks_first", evict_unreferenced_full_blocks_first);
+        Put(writer, "score_alpha", score_alpha);
+        Put(writer, "score_min_interval_seconds", score_min_interval_seconds);
+        Put(writer, "score_first_hit_interval_seconds", score_first_hit_interval_seconds);
+        Put(writer, "score_initial_hotness", score_initial_hotness);
+        Put(writer, "score_max_hotness", score_max_hotness);
     }
 };
 

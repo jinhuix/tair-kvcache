@@ -17,6 +17,33 @@ namespace kv_cache_manager {
 namespace {
 int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
 
+class CheckpointAdmissionPinGuard {
+public:
+    CheckpointAdmissionPinGuard(CheckpointLruEvictionPolicy *policy,
+                                const std::vector<uint64_t> *protected_checkpoint_ids)
+        : policy_(policy) {
+        if (policy_ != nullptr) {
+            if (protected_checkpoint_ids != nullptr) {
+                policy_->SetProtectedCheckpointsForAdmission(*protected_checkpoint_ids);
+            } else {
+                policy_->ClearProtectedCheckpointsForAdmission();
+            }
+        }
+    }
+
+    ~CheckpointAdmissionPinGuard() {
+        if (policy_ != nullptr) {
+            policy_->ClearProtectedCheckpointsForAdmission();
+        }
+    }
+
+    CheckpointAdmissionPinGuard(const CheckpointAdmissionPinGuard &) = delete;
+    CheckpointAdmissionPinGuard &operator=(const CheckpointAdmissionPinGuard &) = delete;
+
+private:
+    CheckpointLruEvictionPolicy *policy_;
+};
+
 void ValidateSupportedQueryTypeOrThrow(const std::string &query_type) {
     if (!IsSupportedQueryType(query_type)) {
         throw std::runtime_error("Unsupported optimizer query_type: " + query_type);
@@ -133,6 +160,7 @@ void OptimizerRunner::ResetReplayState(bool clear_mamba_state) {
         next_mamba_state_sequence_ = 0;
         next_mamba_checkpoint_id_ = 1;
     }
+    latest_mamba_read_results_.clear();
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -166,12 +194,20 @@ void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
     ValidateSupportedQueryTypeOrThrow(trace.query_type());
     ReadRecord read_record = HandleGetLocation(trace);
     stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
-    const size_t mamba_hit_blocks =
-        mamba_state_config_.enabled() ? read_record.mamba_state_hit_blocks : 0;
-    ScheduleRequestWrite(trace, mamba_hit_blocks);
+    const size_t mamba_hit_blocks = mamba_state_config_.enabled() ? read_record.mamba_state_hit_blocks : 0;
+    std::vector<uint64_t> protected_checkpoint_ids;
+    if (mamba_state_config_.enabled()) {
+        const auto state_it = latest_mamba_read_results_.find(trace.instance_id());
+        if (state_it != latest_mamba_read_results_.end() && state_it->second.trace_id == trace.trace_id()) {
+            protected_checkpoint_ids = state_it->second.hit_checkpoint_ids;
+        }
+    }
+    ScheduleRequestWrite(trace, mamba_hit_blocks, std::move(protected_checkpoint_ids));
 }
 
-void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace, size_t mamba_hit_blocks) {
+void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace,
+                                           size_t mamba_hit_blocks,
+                                           std::vector<uint64_t> protected_checkpoint_ids) {
     if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
         throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
                                  ", trace_id=" + trace.trace_id());
@@ -183,8 +219,11 @@ void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace, size
     write_trace.set_timestamp_ns(trace.timestamp_ns() + write_delay_ns_);
     write_trace.set_keys(trace.keys());
     write_trace.set_ttl_us(trace.ttl_us());
-    pending_writes_.push(PendingWrite{
-        write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace), mamba_hit_blocks});
+    pending_writes_.push(PendingWrite{write_trace.timestamp_ns(),
+                                      next_pending_write_sequence_++,
+                                      std::move(write_trace),
+                                      mamba_hit_blocks,
+                                      std::move(protected_checkpoint_ids)});
 }
 
 void OptimizerRunner::FlushPendingWritesThrough(int64_t timestamp_ns) {
@@ -204,7 +243,8 @@ void OptimizerRunner::FlushAllPendingWrites() {
 }
 
 void OptimizerRunner::RunPendingWrite(const PendingWrite &pending) {
-    HandleCacheInsert(pending.trace, true, nullptr, pending.mamba_hit_blocks);
+    HandleCacheInsert(
+        pending.trace, true, nullptr, pending.mamba_hit_blocks, &pending.protected_checkpoint_ids);
     stats_collector_->UpdateTimestamp(pending.trace.instance_id(), pending.trace.timestamp_ns());
 }
 
@@ -316,8 +356,11 @@ ReadRecord OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trac
     }
     local_read_block_num = local_hits_are_reads ? local_mask_block_num : 0;
     remote_read_block_num = trace.keys().size() - local_mask_block_num;
-    const auto [mamba_state_candidate_blocks, mamba_state_hit_blocks] =
-        ApplyMambaStateRead(instance_id, trace.keys(), trace.timestamp_ns(), &query_hit);
+    const auto mamba_read_result = ApplyMambaStateRead(instance_id, trace.keys(), trace.timestamp_ns(), &query_hit);
+    latest_mamba_read_results_[instance_id] =
+        LatestMambaReadResult{trace.trace_id(), mamba_read_result.hit_checkpoint_ids};
+    const size_t mamba_state_candidate_blocks = mamba_read_result.candidate_prefix_blocks;
+    const size_t mamba_state_hit_blocks = mamba_read_result.hit_blocks;
     if (defer_full_touch_until_mamba_hit && mamba_state_hit_blocks > 0) {
         std::vector<int64_t> touched_keys(trace.keys().begin(), trace.keys().begin() + mamba_state_hit_blocks);
         indexer->TouchKeysAtTier(touched_keys, "shared", trace.timestamp_ns(), refresh_ttl_on_read);
@@ -363,6 +406,7 @@ void OptimizerRunner::ClearMambaState(const std::string &instance_id) {
     }
     mamba_state_checkpoints_.erase(instance_id);
     mamba_branch_prefix_history_.erase(instance_id);
+    latest_mamba_read_results_.erase(instance_id);
 }
 
 void OptimizerRunner::ClearAllMambaStates() {
@@ -375,6 +419,7 @@ void OptimizerRunner::ClearAllMambaStates() {
         ClearMambaState(instance_id);
     }
     mamba_branch_prefix_history_.clear();
+    latest_mamba_read_results_.clear();
     mamba_state_object_index_.clear();
 }
 
@@ -501,7 +546,7 @@ bool OptimizerRunner::RegisterCheckpointWithEvictionPolicy(const std::string &in
         record->eviction_id = next_mamba_checkpoint_id_++;
     }
     if (policy->HasCheckpoint(record->eviction_id)) {
-        return policy->TouchCheckpoint(record->eviction_id, timestamp_ns);
+        return true;
     }
 
     auto indexer = GetIndexer(instance_id);
@@ -535,7 +580,12 @@ bool OptimizerRunner::RegisterMambaStateObject(const std::string &instance_id,
         record->objects.resize(group_count);
     }
     if (record->objects[group_slot] != nullptr) {
-        return false;
+        auto *existing = record->objects[group_slot].get();
+        if (existing->location_map.find("shared") != existing->location_map.end()) {
+            return false;
+        }
+        mamba_state_object_index_.erase(existing);
+        record->objects[group_slot].reset();
     }
     const size_t group_id = group_slot + 1; // full-attention uses group id 0; Mamba groups start at 1.
     auto object = std::make_unique<BlockEntry>();
@@ -773,12 +823,12 @@ void OptimizerRunner::ObserveMambaBranchPrefixes(const std::string &instance_id,
     }
 }
 
-std::pair<size_t, size_t> OptimizerRunner::ApplyMambaStateRead(const std::string &instance_id,
-                                                               const std::vector<int64_t> &keys,
-                                                               int64_t timestamp_ns,
-                                                               QueryHit *query_hit) {
+OptimizerRunner::MambaReadResult OptimizerRunner::ApplyMambaStateRead(const std::string &instance_id,
+                                                                       const std::vector<int64_t> &keys,
+                                                                       int64_t timestamp_ns,
+                                                                       QueryHit *query_hit) {
     if (!mamba_state_config_.enabled() || query_hit == nullptr) {
-        return {0, 0};
+        return {};
     }
 
     auto &checkpoints = mamba_state_checkpoints_[instance_id];
@@ -790,15 +840,19 @@ std::pair<size_t, size_t> OptimizerRunner::ApplyMambaStateRead(const std::string
         query_hit->remote_hit_indices.clear();
         query_hit->local_hit_indices.clear();
         std::fill(query_hit->per_tier_hit_block_num.begin(), query_hit->per_tier_hit_block_num.end(), 0);
-        return {candidate_prefix, 0};
+        return MambaReadResult{candidate_prefix, 0, {}};
     }
 
     const auto signatures = BuildPrefixSignatures(keys);
     size_t hit_blocks = 0;
+    std::vector<uint64_t> hit_checkpoint_ids;
     for (size_t prefix_len = candidate_prefix; prefix_len > 0; --prefix_len) {
         auto checkpoint_it = checkpoints.find(signatures[prefix_len]);
         if (checkpoint_it != checkpoints.end() && MambaCheckpointIsResident(checkpoint_it->second)) {
             hit_blocks = prefix_len;
+            if (checkpoint_it->second.eviction_id != 0) {
+                hit_checkpoint_ids.push_back(checkpoint_it->second.eviction_id);
+            }
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
             if (auto *policy = GetCheckpointLruPolicy(instance_id); policy != nullptr) {
@@ -820,7 +874,7 @@ std::pair<size_t, size_t> OptimizerRunner::ApplyMambaStateRead(const std::string
         tier_hits = kept;
         remaining_tier_hits -= kept;
     }
-    return {candidate_prefix, hit_blocks};
+    return MambaReadResult{candidate_prefix, hit_blocks, std::move(hit_checkpoint_ids)};
 }
 
 void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
@@ -936,7 +990,8 @@ size_t OptimizerRunner::EvictMambaStateIfNeeded(const std::string &instance_id) 
 WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trace,
                                                bool count_new_tier_write_touch,
                                                const std::vector<size_t> *materialized_indices,
-                                               size_t mamba_hit_blocks) {
+                                               size_t mamba_hit_blocks,
+                                               const std::vector<uint64_t> *protected_checkpoint_ids) {
     WriteRecord record;
     record.timestamp_ns = trace.timestamp_ns();
     record.trace_id = trace.trace_id();
@@ -965,6 +1020,7 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
         }
         effective_materialized_indices = &mamba_checkpoint_admission_indices;
     }
+    const std::vector<size_t> *requested_materialized_indices = effective_materialized_indices;
 
     const size_t branch_prefix_touch_blocks =
         MambaBranchPrefixAdmissionTouchBlocks(instance_id, trace.keys(), effective_materialized_indices, mamba_hit_blocks);
@@ -973,6 +1029,54 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
     }
 
     auto *checkpoint_policy = GetCheckpointLruPolicy(instance_id);
+    CheckpointAdmissionPinGuard checkpoint_pin_guard(checkpoint_policy, protected_checkpoint_ids);
+    std::vector<size_t> checkpoint_lru_admission_indices;
+    const auto refresh_checkpoint_lru_admission_indices = [&]() -> size_t {
+        if (checkpoint_policy == nullptr) {
+            return 0;
+        }
+
+        std::vector<bool> selected(trace.keys().size(), requested_materialized_indices == nullptr);
+        size_t requested_count = requested_materialized_indices == nullptr ? trace.keys().size() : 0;
+        if (requested_materialized_indices != nullptr) {
+            for (const size_t idx : *requested_materialized_indices) {
+                if (idx < selected.size() && !selected[idx]) {
+                    selected[idx] = true;
+                    ++requested_count;
+                }
+            }
+        }
+
+        size_t added_missing_path_blocks = 0;
+        for (size_t idx = 0; idx < trace.keys().size(); ++idx) {
+            BlockEntry *block = indexer->FindPathBlock(trace.keys(), idx);
+            if (block == nullptr || block->location_map.find("shared") == block->location_map.end()) {
+                if (!selected[idx]) {
+                    selected[idx] = true;
+                    ++added_missing_path_blocks;
+                }
+            }
+        }
+
+        checkpoint_lru_admission_indices.clear();
+        checkpoint_lru_admission_indices.reserve(trace.keys().size());
+        for (size_t idx = 0; idx < selected.size(); ++idx) {
+            if (selected[idx]) {
+                checkpoint_lru_admission_indices.push_back(idx);
+            }
+        }
+        effective_materialized_indices = &checkpoint_lru_admission_indices;
+
+        if (added_missing_path_blocks > 0) {
+            KVCM_LOG_WARN("checkpoint_lru admission added missing path blocks instance_id=%s trace_id=%s "
+                          "requested_blocks=%zu added_missing_path_blocks=%zu final_materialized_blocks=%zu "
+                          "mamba_hit_blocks=%zu total_blocks=%zu",
+                          instance_id.c_str(), trace.trace_id().c_str(), requested_count, added_missing_path_blocks,
+                          checkpoint_lru_admission_indices.size(), mamba_hit_blocks, trace.keys().size());
+        }
+        return added_missing_path_blocks;
+    };
+    refresh_checkpoint_lru_admission_indices();
     const auto compute_admission_blocks = [&]() {
         const size_t full_blocks = checkpoint_policy == nullptr
                                        ? CountMaterializedBlocks(trace.keys().size(), effective_materialized_indices)
@@ -992,6 +1096,7 @@ WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trac
         MergeEvictedBlocks(&pending_evicted_blocks, admission_eviction.evicted_blocks);
         indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
         pending_evicted_blocks.clear();
+        refresh_checkpoint_lru_admission_indices();
 
         if (checkpoint_policy == nullptr) {
             admission_fits = true; // Preserve the behavior of existing policies.

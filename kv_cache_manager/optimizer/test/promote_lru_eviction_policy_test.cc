@@ -11,6 +11,8 @@ using namespace kv_cache_manager;
 
 class PromoteLruEvictionPolicyTest : public TESTBASE {
 protected:
+    static constexpr int64_t kSecondNs = 1000000000LL;
+
     PromoteLruParams DefaultParams() {
         PromoteLruParams params;
         params.shard_count = 1;
@@ -104,6 +106,68 @@ TEST_F(PromoteLruEvictionPolicyTest, DisabledTierFallsBackToPlainLru) {
     EXPECT_EQ(evicted[0]->key, 1);
     EXPECT_TRUE(block1.location_map.empty());
     EXPECT_FALSE(block2.location_map.empty());
+}
+
+TEST_F(PromoteLruEvictionPolicyTest, TtlEvictsExpiredProbationBeforeExpiredProtected) {
+    auto params = DefaultParams();
+    params.ttl_seconds = 10;
+    PromoteLruEvictionPolicy policy("shared", params);
+    auto probation_expired = MakeBlock(1, "shared", 0);
+    auto protected_expired = MakeBlock(2, "shared", 0);
+    auto probation_live = MakeBlock(3, "shared", 15 * kSecondNs);
+
+    policy.OnBlockWritten(&probation_expired);
+    policy.OnBlockWritten(&protected_expired);
+    policy.OnBlockAccessedWithOptions(&protected_expired, 0, true);
+    policy.OnBlockWritten(&probation_live);
+    policy.AdvanceClock(15 * kSecondNs);
+
+    auto evicted = policy.EvictBlocks(2);
+    ASSERT_EQ(evicted.size(), 2);
+    EXPECT_EQ(evicted[0]->key, 1);
+    EXPECT_EQ(evicted[1]->key, 2);
+    EXPECT_TRUE(probation_expired.location_map.empty());
+    EXPECT_TRUE(protected_expired.location_map.empty());
+    EXPECT_FALSE(probation_live.location_map.empty());
+}
+
+TEST_F(PromoteLruEvictionPolicyTest, TtlFallsBackToProbationThenProtectedLru) {
+    auto params = DefaultParams();
+    params.ttl_seconds = 10;
+    PromoteLruEvictionPolicy policy("shared", params);
+    auto probation_expired = MakeBlock(1, "shared", 0);
+    auto probation_live = MakeBlock(2, "shared", 15 * kSecondNs);
+    auto protected_live = MakeBlock(3, "shared", 16 * kSecondNs);
+
+    policy.OnBlockWritten(&probation_expired);
+    policy.OnBlockWritten(&probation_live);
+    policy.OnBlockWritten(&protected_live);
+    policy.OnBlockAccessedWithOptions(&protected_live, 16 * kSecondNs, true);
+    policy.AdvanceClock(17 * kSecondNs);
+
+    auto evicted = policy.EvictBlocks(3);
+    ASSERT_EQ(evicted.size(), 3);
+    EXPECT_EQ(evicted[0]->key, 1);
+    EXPECT_EQ(evicted[1]->key, 2);
+    EXPECT_EQ(evicted[2]->key, 3);
+}
+
+TEST_F(PromoteLruEvictionPolicyTest, TtlRefreshKeepsAccessedProtectedBlockAlive) {
+    auto params = DefaultParams();
+    params.ttl_seconds = 10;
+    PromoteLruEvictionPolicy policy("shared", params);
+    auto protected_refreshed = MakeBlock(1, "shared", 0);
+    auto probation_expired = MakeBlock(2, "shared", 0);
+
+    policy.OnBlockWritten(&protected_refreshed);
+    policy.OnBlockAccessedWithOptions(&protected_refreshed, 8 * kSecondNs, true);
+    policy.OnBlockWritten(&probation_expired);
+    policy.AdvanceClock(11 * kSecondNs);
+
+    auto evicted = policy.EvictBlocks(1);
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted[0]->key, 2);
+    EXPECT_FALSE(protected_refreshed.location_map.empty());
 }
 
 TEST_F(PromoteLruEvictionPolicyTest, FactoryCreatesPromoteLruPolicy) {

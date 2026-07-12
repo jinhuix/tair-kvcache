@@ -553,6 +553,64 @@ TEST_F(OptimizerManagerTest, CheckpointLruBranchEndSharesPrefixAndReservesOnlyMi
     EXPECT_EQ(manager.GetCacheLocation("instance1", "read_branch", 4000, {1, 2, 9}, mask3, 3).kvcm_hit_length, 3);
 }
 
+TEST_F(OptimizerManagerTest, CheckpointLruAdmissionProtectsReadHitCheckpointAndRejectsWhenFull) {
+    auto config = CreateTestOptimizerConfig();
+    config.set_trace_file_path(GetTestTempRootPath() + "/checkpoint_lru_rewrite_evicted_prefix.jsonl");
+    config.set_output_result_path(GetTestTempRootPath() + "/checkpoint_lru_rewrite_evicted_prefix_result");
+
+    OptTraceReplayConfig trace_replay_config;
+    trace_replay_config.set_mode(TraceReplayMode::REQUEST);
+    trace_replay_config.set_write_delay_ns(1);
+    config.set_trace_replay_config(trace_replay_config);
+
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH);
+    mamba_state.set_branch_save_request_end_checkpoint(true);
+    mamba_state.set_bytes_per_state(1);
+    mamba_state.set_group_count(1);
+    config.set_mamba_state_config(mamba_state);
+
+    auto group = config.instance_groups()[0];
+    group.set_quota_capacity(4);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    instances[0].set_block_size(1);
+    instances[0].set_bytes_per_token(1);
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_CHECKPOINT_LRU);
+    instances[0].set_eviction_policy_param(CheckpointLruParams{});
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    {
+        std::ofstream out(config.trace_file_path());
+        out << R"({"type":"request","instance_id":"instance1","trace_id":"seed","timestamp_ns":1000,"keys":[1,2],"input_len":2,"block_mask":[false,false]})"
+            << "\n";
+        out << R"({"type":"request","instance_id":"instance1","trace_id":"branch","timestamp_ns":2000,"keys":[1,2,9],"input_len":3,"block_mask":[false,false,false]})"
+            << "\n";
+    }
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    ASSERT_NO_THROW(manager.DirectRun());
+
+    auto policy = std::dynamic_pointer_cast<CheckpointLruEvictionPolicy>(
+        manager.eviction_manager_->GetSharedPolicy("instance1"));
+    ASSERT_NE(policy, nullptr);
+    EXPECT_EQ(policy->size(), 3);
+    EXPECT_EQ(policy->checkpoint_count(), 1);
+
+    BlockMask branch_mask = std::vector<bool>{false, false, false};
+    auto branch_hit =
+        manager.GetCacheLocation("instance1", "read_branch_after_reject", 3000, {1, 2, 9}, branch_mask, 3);
+    EXPECT_EQ(branch_hit.kvcm_hit_length, 2);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->mamba_state_candidate_blocks, 2);
+    EXPECT_EQ(last_read->mamba_state_hit_blocks, 2);
+}
+
 TEST_F(OptimizerManagerTest, CheckpointLruRejectsCheckpointLargerThanCapacity) {
     auto config = CreateTestOptimizerConfig();
     OptMambaStateConfig mamba_state;

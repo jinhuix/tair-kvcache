@@ -68,22 +68,24 @@ TEST_F(CheckpointLruEvictionPolicyTest, SharedPrefixSurvivesUntilLastCheckpointI
     ASSERT_TRUE(policy.RegisterCheckpoint(2, &full4, {&deep_state}, 20));
 
     auto first = policy.EvictBlocks(1);
-    ASSERT_EQ(first.size(), 1);
-    EXPECT_EQ(first[0], &shallow_state);
+    ASSERT_EQ(first.size(), 3);
+    EXPECT_TRUE(Contains(first, &deep_state));
+    EXPECT_TRUE(Contains(first, &full3));
+    EXPECT_TRUE(Contains(first, &full4));
     EXPECT_FALSE(full1.location_map.empty());
     EXPECT_FALSE(full2.location_map.empty());
     EXPECT_EQ(full1.checkpoint_ref_count, 1);
     EXPECT_EQ(full2.checkpoint_ref_count, 1);
 
     auto second = policy.EvictBlocks(1);
-    ASSERT_EQ(second.size(), 5);
-    EXPECT_TRUE(Contains(second, &deep_state));
+    ASSERT_EQ(second.size(), 3);
+    EXPECT_TRUE(Contains(second, &shallow_state));
     EXPECT_TRUE(Contains(second, &full1));
-    EXPECT_TRUE(Contains(second, &full4));
+    EXPECT_TRUE(Contains(second, &full2));
     EXPECT_EQ(policy.size(), 0);
 }
 
-TEST_F(CheckpointLruEvictionPolicyTest, TouchUsesCheckpointLevelExactLru) {
+TEST_F(CheckpointLruEvictionPolicyTest, HotCheckpointCanOutrankLowerCostCheckpoint) {
     CheckpointLruEvictionPolicy policy("shared", CheckpointLruParams{});
     auto full1 = FullBlock(1);
     auto full2 = FullBlock(2, &full1);
@@ -97,16 +99,12 @@ TEST_F(CheckpointLruEvictionPolicyTest, TouchUsesCheckpointLevelExactLru) {
     }
     ASSERT_TRUE(policy.RegisterCheckpoint(1, &full2, {&shallow_state}, 10));
     ASSERT_TRUE(policy.RegisterCheckpoint(2, &full4, {&deep_state}, 20));
-    ASSERT_TRUE(policy.TouchCheckpoint(1, 30));
+    ASSERT_TRUE(policy.TouchCheckpoint(2, 30));
 
     const auto evicted = policy.EvictBlocks(1);
-    ASSERT_EQ(evicted.size(), 3);
-    EXPECT_TRUE(Contains(evicted, &deep_state));
-    EXPECT_TRUE(Contains(evicted, &full3));
-    EXPECT_TRUE(Contains(evicted, &full4));
-    EXPECT_FALSE(full1.location_map.empty());
-    EXPECT_FALSE(full2.location_map.empty());
-    EXPECT_TRUE(policy.HasCheckpoint(1));
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted[0], &shallow_state);
+    EXPECT_TRUE(policy.HasCheckpoint(2));
 }
 
 TEST_F(CheckpointLruEvictionPolicyTest, WrittenTailIsKeptThenReclaimedFirstUnderPressure) {

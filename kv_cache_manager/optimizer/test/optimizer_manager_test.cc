@@ -295,6 +295,67 @@ TEST_F(OptimizerManagerTest, MambaStateBranchCanAlsoSaveRequestEndCheckpoint) {
     EXPECT_EQ(read_record->mamba_state_hit_blocks, 3);
 }
 
+TEST_F(OptimizerManagerTest, MambaStateBranchChunkSavesUnionOfCheckpointTypes) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_checkpoint_strategy(MambaCheckpointStrategy::BRANCH_CHUNK);
+    mamba_state.set_chunk_size_blocks(3);
+    mamba_state.set_bytes_per_state(128);
+    mamba_state.set_group_count(2);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    manager.WriteCache("instance1", "write_first", 1000, {1, 2, 3, 4, 5, 6});
+    manager.WriteCache("instance1", "write_branch", 2000, {1, 2, 3, 4, 9});
+
+    BlockMask prefix_mask = std::vector<bool>{false, false, false, false};
+    auto branch_hit = manager.GetCacheLocation(
+        "instance1", "read_branch_checkpoint", 3000, {1, 2, 3, 4}, prefix_mask, 64);
+    EXPECT_EQ(branch_hit.kvcm_hit_length, 4);
+
+    const auto *branch_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(branch_record, nullptr);
+    EXPECT_EQ(branch_record->mamba_state_candidate_blocks, 4);
+    EXPECT_EQ(branch_record->mamba_state_hit_blocks, 4);
+
+    BlockMask full_mask = std::vector<bool>{false, false, false, false, false};
+    auto chunk_end_hit =
+        manager.GetCacheLocation("instance1", "read_chunk_end", 4000, {1, 2, 3, 4, 9}, full_mask, 80);
+    EXPECT_EQ(chunk_end_hit.kvcm_hit_length, 5);
+
+    const auto *chunk_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(chunk_record, nullptr);
+    EXPECT_EQ(chunk_record->mamba_state_candidate_blocks, 5);
+    EXPECT_EQ(chunk_record->mamba_state_hit_blocks, 5);
+}
+
+TEST_F(OptimizerManagerTest, MambaStateBranchChunkConfigParsesAndSerializesCanonicalName) {
+    OptMambaStateConfig config;
+    ASSERT_TRUE(config.FromJsonString(
+        R"({"enabled":true,"checkpoint_strategy":"branch+chunk","chunk_size_blocks":3})"));
+    EXPECT_EQ(config.checkpoint_strategy(), MambaCheckpointStrategy::BRANCH_CHUNK);
+    EXPECT_EQ(config.chunk_size_blocks(), 3);
+    EXPECT_NE(config.ToJsonString().find(R"("checkpoint_strategy":"branch_chunk")"), std::string::npos);
+
+    OptMambaStateConfig missing_chunk_size;
+    EXPECT_FALSE(missing_chunk_size.FromJsonString(R"({"enabled":true,"checkpoint_strategy":"branch_chunk"})"));
+}
+
 TEST_F(OptimizerManagerTest, MambaStateResidentCheckpointsUseLruEviction) {
     auto config = CreateTestOptimizerConfig();
     OptMambaStateConfig mamba_state;

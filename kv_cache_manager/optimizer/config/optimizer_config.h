@@ -23,6 +23,7 @@ std::string ToString(const TraceReplayMode &mode);
 enum class MambaCheckpointStrategy {
     CHUNK = 0,
     BRANCH = 1,
+    BRANCH_CHUNK = 2,
 };
 
 MambaCheckpointStrategy ToMambaCheckpointStrategy(const std::string &str);

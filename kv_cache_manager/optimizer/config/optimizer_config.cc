@@ -26,13 +26,20 @@ MambaCheckpointStrategy ToMambaCheckpointStrategy(const std::string &str) {
     if (str == "branch") {
         return MambaCheckpointStrategy::BRANCH;
     }
+    if (str == "branch_chunk" || str == "branch+chunk") {
+        return MambaCheckpointStrategy::BRANCH_CHUNK;
+    }
     return MambaCheckpointStrategy::CHUNK;
 }
 
-bool IsValidMambaCheckpointStrategy(const std::string &str) { return str == "chunk" || str == "branch"; }
+bool IsValidMambaCheckpointStrategy(const std::string &str) {
+    return str == "chunk" || str == "branch" || str == "branch_chunk" || str == "branch+chunk";
+}
 
 std::string ToString(const MambaCheckpointStrategy &strategy) {
     switch (strategy) {
+    case MambaCheckpointStrategy::BRANCH_CHUNK:
+        return "branch_chunk";
     case MambaCheckpointStrategy::BRANCH:
         return "branch";
     case MambaCheckpointStrategy::CHUNK:
@@ -75,7 +82,7 @@ bool OptMambaStateConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     std::string checkpoint_strategy = "chunk";
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "checkpoint_strategy", checkpoint_strategy, std::string("chunk"));
     if (!IsValidMambaCheckpointStrategy(checkpoint_strategy)) {
-        KVCM_LOG_ERROR("mamba_state.checkpoint_strategy must be chunk or branch");
+        KVCM_LOG_ERROR("mamba_state.checkpoint_strategy must be chunk, branch, or branch_chunk");
         return false;
     }
     checkpoint_strategy_ = ToMambaCheckpointStrategy(checkpoint_strategy);
@@ -87,11 +94,14 @@ bool OptMambaStateConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         KVCM_JSON_GET_MACRO(rapid_value, "chunk_size_blocks", chunk_size_blocks);
     } else if (rapid_value.HasMember("chunk_size")) {
         KVCM_JSON_GET_MACRO(rapid_value, "chunk_size", chunk_size_blocks);
-    } else if (checkpoint_strategy_ == MambaCheckpointStrategy::CHUNK) {
+    } else if (checkpoint_strategy_ == MambaCheckpointStrategy::CHUNK ||
+               checkpoint_strategy_ == MambaCheckpointStrategy::BRANCH_CHUNK) {
         KVCM_LOG_ERROR("mamba_state requires positive chunk_size_blocks");
         return false;
     }
-    if (checkpoint_strategy_ == MambaCheckpointStrategy::CHUNK && chunk_size_blocks == 0) {
+    if ((checkpoint_strategy_ == MambaCheckpointStrategy::CHUNK ||
+         checkpoint_strategy_ == MambaCheckpointStrategy::BRANCH_CHUNK) &&
+        chunk_size_blocks == 0) {
         KVCM_LOG_ERROR("mamba_state.chunk_size_blocks must be positive");
         return false;
     }

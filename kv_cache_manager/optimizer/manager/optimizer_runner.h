@@ -108,6 +108,8 @@ private:
         const std::string &instance_id,
         size_t key_count,
         const std::vector<PrefixSignature> &prefix_signatures) const;
+    bool UsesBranchMambaCheckpoints() const;
+    bool UsesChunkMambaCheckpoints() const;
     bool UsesSharedMambaCapacity() const;
     size_t MambaCheckpointObjectCount(const MambaCheckpointRecord &record) const;
     bool MambaCheckpointIsResident(const MambaCheckpointRecord &record) const;

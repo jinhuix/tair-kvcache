@@ -443,10 +443,27 @@ std::vector<size_t> OptimizerRunner::SelectMambaCheckpointIndices(
     const std::string &instance_id,
     size_t key_count,
     const std::vector<PrefixSignature> &prefix_signatures) const {
-    if (mamba_state_config_.checkpoint_strategy() == MambaCheckpointStrategy::BRANCH) {
+    if (!UsesChunkMambaCheckpoints()) {
         return BranchMambaCheckpointIndices(instance_id, prefix_signatures);
     }
-    return ChunkMambaCheckpointIndices(key_count);
+    auto indices = ChunkMambaCheckpointIndices(key_count);
+    if (UsesBranchMambaCheckpoints()) {
+        auto branch_indices = BranchMambaCheckpointIndices(instance_id, prefix_signatures);
+        indices.insert(indices.end(), branch_indices.begin(), branch_indices.end());
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    }
+    return indices;
+}
+
+bool OptimizerRunner::UsesBranchMambaCheckpoints() const {
+    const auto strategy = mamba_state_config_.checkpoint_strategy();
+    return strategy == MambaCheckpointStrategy::BRANCH || strategy == MambaCheckpointStrategy::BRANCH_CHUNK;
+}
+
+bool OptimizerRunner::UsesChunkMambaCheckpoints() const {
+    const auto strategy = mamba_state_config_.checkpoint_strategy();
+    return strategy == MambaCheckpointStrategy::CHUNK || strategy == MambaCheckpointStrategy::BRANCH_CHUNK;
 }
 
 bool OptimizerRunner::UsesSharedMambaCapacity() const {
@@ -624,12 +641,12 @@ size_t OptimizerRunner::MambaBranchPrefixAdmissionTouchBlocks(
     const std::vector<size_t> *materialized_indices,
     size_t min_checkpoint_prefix_blocks) const {
     if (!mamba_state_config_.enabled() || !UsesSharedMambaCapacity() || keys.empty() ||
-        mamba_state_config_.checkpoint_strategy() != MambaCheckpointStrategy::BRANCH) {
+        !UsesBranchMambaCheckpoints()) {
         return 0;
     }
 
     const auto signatures = BuildPrefixSignatures(keys);
-    const auto checkpoint_indices = SelectMambaCheckpointIndices(instance_id, keys.size(), signatures);
+    const auto checkpoint_indices = BranchMambaCheckpointIndices(instance_id, signatures);
     const auto history_it = mamba_branch_prefix_history_.find(instance_id);
     if (checkpoint_indices.empty() || history_it == mamba_branch_prefix_history_.end()) {
         return 0;
@@ -722,7 +739,7 @@ size_t OptimizerRunner::HandleMambaStateEvictions(OptIndexerManager::EvictedBloc
 
 void OptimizerRunner::ObserveMambaBranchPrefixes(const std::string &instance_id,
                                                  const std::vector<PrefixSignature> &prefix_signatures) {
-    if (mamba_state_config_.checkpoint_strategy() != MambaCheckpointStrategy::BRANCH || prefix_signatures.size() <= 1) {
+    if (!UsesBranchMambaCheckpoints() || prefix_signatures.size() <= 1) {
         return;
     }
 
@@ -794,11 +811,11 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
         ObserveMambaBranchPrefixes(instance_id, signatures);
         return;
     }
-    const auto history_it = mamba_branch_prefix_history_.find(instance_id);
-    const auto is_historical_branch_prefix = [&](const PrefixSignature &signature) {
-        return mamba_state_config_.checkpoint_strategy() == MambaCheckpointStrategy::BRANCH &&
-               history_it != mamba_branch_prefix_history_.end() && history_it->second.count(signature) > 0;
-    };
+    std::unordered_set<size_t> branch_checkpoint_indices;
+    if (UsesBranchMambaCheckpoints()) {
+        const auto selected_branch_indices = BranchMambaCheckpointIndices(instance_id, signatures);
+        branch_checkpoint_indices.insert(selected_branch_indices.begin(), selected_branch_indices.end());
+    }
 
     std::vector<bool> allowed(keys.size(), true);
     if (materialized_indices != nullptr) {
@@ -834,7 +851,7 @@ void OptimizerRunner::ApplyMambaStateWrite(const std::string &instance_id,
             }
             checkpoint_it->second.last_access_ns = timestamp_ns;
             checkpoint_it->second.sequence = next_mamba_state_sequence_++;
-            if (registered_new_object && is_historical_branch_prefix(signatures[idx + 1])) {
+            if (registered_new_object && branch_checkpoint_indices.count(idx) > 0) {
                 TouchMambaCheckpointObjects(instance_id, &checkpoint_it->second, timestamp_ns);
                 TouchMambaBranchPrefixOnAdmission(instance_id, keys, checkpoint_prefix_blocks, timestamp_ns);
             }

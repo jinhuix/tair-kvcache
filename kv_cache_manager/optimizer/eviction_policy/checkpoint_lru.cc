@@ -1,8 +1,6 @@
 #include "kv_cache_manager/optimizer/eviction_policy/checkpoint_lru.h"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <stdexcept>
 #include <tuple>
 
@@ -14,11 +12,13 @@ CheckpointLruEvictionPolicy::CheckpointLruEvictionPolicy(const std::string &name
                                                          const CheckpointLruParams &params)
     : EvictionPolicy(name)
     , evict_unreferenced_full_blocks_first_(params.evict_unreferenced_full_blocks_first)
-    , score_alpha_(std::clamp(params.score_alpha, 0.0, 1.0))
-    , score_min_interval_seconds_(std::max(params.score_min_interval_seconds, 1e-9))
-    , score_first_hit_interval_seconds_(std::max(params.score_first_hit_interval_seconds, 1e-9))
-    , score_initial_hotness_(std::max(params.score_initial_hotness, 0.0))
-    , score_max_hotness_(std::max(params.score_max_hotness, score_initial_hotness_)) {}
+    , score_value_bonus_seconds_(std::max(params.score_value_bonus_seconds, 0.0)) {}
+
+bool CheckpointLruEvictionPolicy::ScoreHeapGreater::operator()(const ScoreHeapEntry &lhs,
+                                                               const ScoreHeapEntry &rhs) const {
+    return std::tie(lhs.score, lhs.last_access_time, lhs.checkpoint_id) >
+           std::tie(rhs.score, rhs.last_access_time, rhs.checkpoint_id);
+}
 
 void CheckpointLruEvictionPolicy::AddUnreferencedFullBlock(BlockEntry *block) {
     if (block == nullptr || block->owner_node == nullptr || block->checkpoint_ref_count != 0 ||
@@ -59,6 +59,10 @@ bool CheckpointLruEvictionPolicy::RegisterCheckpoint(uint64_t checkpoint_id,
                                                      BlockEntry *full_boundary,
                                                      const std::vector<BlockEntry *> &mamba_objects,
                                                      int64_t timestamp) {
+    if (checkpoint_id == 0) {
+        KVCM_LOG_ERROR("checkpoint_lru register failed reason=checkpoint_id_zero");
+        return false;
+    }
     if (full_boundary == nullptr) {
         KVCM_LOG_ERROR("checkpoint_lru register failed checkpoint_id=%llu reason=full_boundary_null "
                        "mamba_objects=%zu resident_blocks=%zu checkpoints=%zu",
@@ -89,12 +93,20 @@ bool CheckpointLruEvictionPolicy::RegisterCheckpoint(uint64_t checkpoint_id,
                        checkpoints_.size());
         return false;
     }
+    if (full_boundary_to_checkpoint_.count(full_boundary) != 0) {
+        KVCM_LOG_ERROR("checkpoint_lru register failed checkpoint_id=%llu reason=duplicate_full_boundary "
+                       "boundary=%p key=%lld checkpoints=%zu",
+                       static_cast<unsigned long long>(checkpoint_id), static_cast<void *>(full_boundary),
+                       static_cast<long long>(full_boundary->key), checkpoints_.size());
+        return false;
+    }
 
     // Validate the complete prefix and all Mamba groups before changing any
     // reference count, so failed admission is side-effect free.
     std::vector<BlockEntry *> prefix;
     std::unordered_set<BlockEntry *> seen;
     size_t prefix_depth = 0;
+    uint64_t parent_checkpoint_id = 0;
     for (BlockEntry *block = full_boundary; block != nullptr; block = block->prefix_parent) {
         const bool has_owner = block->owner_node != nullptr;
         const bool resident = resident_blocks_.count(block) != 0;
@@ -109,6 +121,12 @@ bool CheckpointLruEvictionPolicy::RegisterCheckpoint(uint64_t checkpoint_id,
                            has_location ? 1 : 0, acyclic ? 1 : 0, block->checkpoint_ref_count,
                            resident_blocks_.size(), checkpoints_.size());
             return false;
+        }
+        if (parent_checkpoint_id == 0) {
+            auto parent_it = full_boundary_to_checkpoint_.find(block);
+            if (parent_it != full_boundary_to_checkpoint_.end()) {
+                parent_checkpoint_id = parent_it->second;
+            }
         }
         prefix.push_back(block);
         ++prefix_depth;
@@ -144,21 +162,81 @@ bool CheckpointLruEvictionPolicy::RegisterCheckpoint(uint64_t checkpoint_id,
     record.full_boundary = full_boundary;
     record.mamba_objects = mamba_objects;
     record.prefix_blocks = prefix.size();
-    record.hotness = score_initial_hotness_;
+    record.parent_checkpoint_id = parent_checkpoint_id;
+    const size_t parent_prefix_blocks =
+        parent_checkpoint_id == 0 ? 0 : checkpoints_.at(parent_checkpoint_id).prefix_blocks;
+    record.marginal_blocks = std::max<size_t>(1, record.prefix_blocks - parent_prefix_blocks);
     record.last_access_time = timestamp;
     record.lru_it = checkpoint_lru_.begin();
-    checkpoints_.emplace(checkpoint_id, std::move(record));
+    auto [checkpoint_it, inserted] = checkpoints_.emplace(checkpoint_id, std::move(record));
+    if (!inserted) {
+        throw std::runtime_error("checkpoint map insertion failed after duplicate validation");
+    }
     full_boundary_to_checkpoint_[full_boundary] = checkpoint_id;
 
+    // A checkpoint can be registered between an existing parent and one or
+    // more of its direct children. Reparent only those direct children whose
+    // prefix contains the new boundary; their marginal value changes. A
+    // previously unreferenced boundary cannot have resident descendants, so
+    // the common append-only admission path avoids scanning siblings/roots.
+    std::vector<uint64_t> candidate_children;
+    if (full_boundary->checkpoint_ref_count != 0) {
+        if (parent_checkpoint_id == 0) {
+            candidate_children.assign(root_checkpoints_.begin(), root_checkpoints_.end());
+        } else {
+            const auto &siblings = checkpoints_.at(parent_checkpoint_id).children;
+            candidate_children.assign(siblings.begin(), siblings.end());
+        }
+    }
+    std::unordered_set<uint64_t> scores_to_update;
+    for (uint64_t child_id : candidate_children) {
+        auto child_it = checkpoints_.find(child_id);
+        if (child_it == checkpoints_.end() ||
+            !IsCheckpointDescendantOf(child_it->second, full_boundary, prefix.size())) {
+            continue;
+        }
+        if (parent_checkpoint_id == 0) {
+            root_checkpoints_.erase(child_id);
+        } else {
+            checkpoints_.at(parent_checkpoint_id).children.erase(child_id);
+        }
+        child_it->second.parent_checkpoint_id = checkpoint_id;
+        child_it->second.marginal_blocks =
+            std::max<size_t>(1, child_it->second.prefix_blocks - prefix.size());
+        checkpoint_it->second.children.insert(child_id);
+        scores_to_update.insert(child_id);
+    }
+    if (parent_checkpoint_id == 0) {
+        root_checkpoints_.insert(checkpoint_id);
+    } else {
+        checkpoints_.at(parent_checkpoint_id).children.insert(checkpoint_id);
+    }
+
     for (auto *block : prefix) {
+        const size_t old_ref_count = block->checkpoint_ref_count;
+        const uint64_t old_checkpoint_xor = full_block_checkpoint_xor_[block];
+        full_block_checkpoint_xor_[block] = old_checkpoint_xor ^ checkpoint_id;
         if (block->checkpoint_ref_count == 0) {
             RemoveUnreferencedFullBlock(block);
+            ++checkpoint_it->second.exclusive_full_blocks;
+        } else if (old_ref_count == 1) {
+            auto sole_owner_it = checkpoints_.find(old_checkpoint_xor);
+            if (sole_owner_it == checkpoints_.end() || sole_owner_it->second.exclusive_full_blocks == 0) {
+                throw std::runtime_error("checkpoint exclusive full block accounting is inconsistent");
+            }
+            --sole_owner_it->second.exclusive_full_blocks;
+            scores_to_update.insert(old_checkpoint_xor);
         }
         ++block->checkpoint_ref_count;
     }
     for (auto *object : mamba_objects) {
         mamba_to_checkpoint_[object] = checkpoint_id;
     }
+    if (score_base_timestamp_ < 0) {
+        score_base_timestamp_ = timestamp;
+    }
+    scores_to_update.insert(checkpoint_id);
+    UpdateCheckpointScores(scores_to_update);
     return true;
 }
 
@@ -168,19 +246,14 @@ bool CheckpointLruEvictionPolicy::TouchCheckpoint(uint64_t checkpoint_id, int64_
         return false;
     }
     auto &record = it->second;
-    double interval_seconds = score_first_hit_interval_seconds_;
-    if (record.last_hit_time >= 0 && timestamp > record.last_hit_time) {
-        interval_seconds = static_cast<double>(timestamp - record.last_hit_time) / 1e9;
+    if (timestamp <= record.last_access_time) {
+        return true;
     }
-    const double interval_minutes = std::max(interval_seconds, score_min_interval_seconds_) / 60.0;
-    const double instant_hotness = 1.0 / interval_minutes;
-    record.hotness = std::min(score_max_hotness_,
-                              (1.0 - score_alpha_) * record.hotness + score_alpha_ * instant_hotness);
-    ++record.hit_count;
-    record.last_hit_time = timestamp;
     record.last_access_time = timestamp;
+    ++record.hit_count;
     checkpoint_lru_.splice(checkpoint_lru_.begin(), checkpoint_lru_, record.lru_it);
     record.lru_it = checkpoint_lru_.begin();
+    UpdateCheckpointScore(checkpoint_id);
     return true;
 }
 
@@ -214,6 +287,32 @@ size_t CheckpointLruEvictionPolicy::DetachCheckpoint(uint64_t checkpoint_id,
     // Copy raw members before erasing the record and its list iterator.
     BlockEntry *boundary = checkpoint_it->second.full_boundary;
     const auto mamba_objects = checkpoint_it->second.mamba_objects;
+    const uint64_t parent_checkpoint_id = checkpoint_it->second.parent_checkpoint_id;
+    const auto children = checkpoint_it->second.children;
+    std::unordered_set<uint64_t> scores_to_update;
+
+    if (parent_checkpoint_id == 0) {
+        root_checkpoints_.erase(checkpoint_id);
+    } else {
+        checkpoints_.at(parent_checkpoint_id).children.erase(checkpoint_id);
+    }
+    for (uint64_t child_id : children) {
+        auto child_it = checkpoints_.find(child_id);
+        if (child_it == checkpoints_.end()) {
+            continue;
+        }
+        child_it->second.parent_checkpoint_id = parent_checkpoint_id;
+        const size_t parent_prefix_blocks =
+            parent_checkpoint_id == 0 ? 0 : checkpoints_.at(parent_checkpoint_id).prefix_blocks;
+        child_it->second.marginal_blocks =
+            std::max<size_t>(1, child_it->second.prefix_blocks - parent_prefix_blocks);
+        if (parent_checkpoint_id == 0) {
+            root_checkpoints_.insert(child_id);
+        } else {
+            checkpoints_.at(parent_checkpoint_id).children.insert(child_id);
+        }
+        scores_to_update.insert(child_id);
+    }
     checkpoint_lru_.erase(checkpoint_it->second.lru_it);
     full_boundary_to_checkpoint_.erase(boundary);
     checkpoints_.erase(checkpoint_it);
@@ -235,13 +334,29 @@ size_t CheckpointLruEvictionPolicy::DetachCheckpoint(uint64_t checkpoint_id,
         if (block->checkpoint_ref_count == 0) {
             throw std::runtime_error("checkpoint prefix reference count underflow");
         }
+        const size_t old_ref_count = block->checkpoint_ref_count;
+        auto xor_it = full_block_checkpoint_xor_.find(block);
+        if (xor_it == full_block_checkpoint_xor_.end()) {
+            throw std::runtime_error("checkpoint prefix xor accounting is missing");
+        }
+        xor_it->second ^= checkpoint_id;
         --block->checkpoint_ref_count;
         if (block->checkpoint_ref_count == 0) {
+            full_block_checkpoint_xor_.erase(xor_it);
             if (DetachPhysicalBlock(block, evicted) && evicted == nullptr) {
                 ++detached_without_output;
             }
+        } else if (old_ref_count == 2) {
+            const uint64_t sole_owner_id = xor_it->second;
+            auto sole_owner_it = checkpoints_.find(sole_owner_id);
+            if (sole_owner_it == checkpoints_.end()) {
+                throw std::runtime_error("remaining sole checkpoint is missing");
+            }
+            ++sole_owner_it->second.exclusive_full_blocks;
+            scores_to_update.insert(sole_owner_id);
         }
     }
+    UpdateCheckpointScores(scores_to_update);
     return evicted == nullptr ? detached_without_output : evicted->size() - before;
 }
 
@@ -261,66 +376,78 @@ size_t CheckpointLruEvictionPolicy::EvictUnreferencedFullBlocks(size_t count,
     return detached;
 }
 
-size_t CheckpointLruEvictionPolicy::EstimateExclusiveFullBlocks(const CheckpointRecord &record) const {
-    size_t exclusive_blocks = 0;
-    std::unordered_set<BlockEntry *> seen;
-    for (BlockEntry *block = record.full_boundary; block != nullptr; block = block->prefix_parent) {
-        if (!seen.insert(block).second) {
-            throw std::runtime_error("cycle detected in checkpoint prefix chain");
-        }
-        if (block->checkpoint_ref_count == 1) {
-            ++exclusive_blocks;
-        }
+bool CheckpointLruEvictionPolicy::IsCheckpointDescendantOf(const CheckpointRecord &record,
+                                                           BlockEntry *ancestor_boundary,
+                                                           size_t ancestor_prefix_blocks) const {
+    if (record.prefix_blocks < ancestor_prefix_blocks) {
+        return false;
     }
-    return exclusive_blocks;
+    BlockEntry *block = record.full_boundary;
+    for (size_t depth = record.prefix_blocks; depth > ancestor_prefix_blocks && block != nullptr; --depth) {
+        block = block->prefix_parent;
+    }
+    return block == ancestor_boundary;
 }
 
-size_t CheckpointLruEvictionPolicy::EstimateFallbackPrefixBlocks(uint64_t checkpoint_id,
-                                                                 const CheckpointRecord &record) const {
-    std::unordered_set<BlockEntry *> seen;
-    for (BlockEntry *block = record.full_boundary; block != nullptr; block = block->prefix_parent) {
-        if (!seen.insert(block).second) {
-            throw std::runtime_error("cycle detected in checkpoint prefix chain");
-        }
-        auto it = full_boundary_to_checkpoint_.find(block);
-        if (it == full_boundary_to_checkpoint_.end() || it->second == checkpoint_id) {
+double CheckpointLruEvictionPolicy::CheckpointScore(const CheckpointRecord &record) const {
+    const size_t evict_cost_blocks =
+        std::max<size_t>(1, record.mamba_objects.size() + record.exclusive_full_blocks);
+    const int64_t elapsed_ns = score_base_timestamp_ < 0 || record.last_access_time <= score_base_timestamp_
+                                   ? 0
+                                   : record.last_access_time - score_base_timestamp_;
+    const double last_access_seconds = static_cast<double>(elapsed_ns) / 1e9;
+    const double value_density = static_cast<double>(record.marginal_blocks) /
+                                 static_cast<double>(record.marginal_blocks + evict_cost_blocks);
+    const double has_hit = record.hit_count == 0 ? 0.0 : 1.0;
+    return last_access_seconds + score_value_bonus_seconds_ * has_hit * value_density;
+}
+
+void CheckpointLruEvictionPolicy::UpdateCheckpointScore(uint64_t checkpoint_id) {
+    auto it = checkpoints_.find(checkpoint_id);
+    if (it == checkpoints_.end()) {
+        return;
+    }
+    auto &record = it->second;
+    record.cached_score = CheckpointScore(record);
+    ++record.score_version;
+    score_heap_.push(
+        ScoreHeapEntry{record.cached_score, record.last_access_time, checkpoint_id, record.score_version});
+    MaybeRebuildScoreHeap();
+}
+
+void CheckpointLruEvictionPolicy::UpdateCheckpointScores(
+    const std::unordered_set<uint64_t> &checkpoint_ids) {
+    for (uint64_t checkpoint_id : checkpoint_ids) {
+        UpdateCheckpointScore(checkpoint_id);
+    }
+}
+
+void CheckpointLruEvictionPolicy::MaybeRebuildScoreHeap() {
+    const size_t max_stale_entries = std::max<size_t>(1024, checkpoints_.size() * 4);
+    if (score_heap_.size() > checkpoints_.size() + max_stale_entries) {
+        RebuildScoreHeap();
+    }
+}
+
+void CheckpointLruEvictionPolicy::RebuildScoreHeap() {
+    decltype(score_heap_) fresh;
+    for (const auto &[checkpoint_id, record] : checkpoints_) {
+        fresh.push(ScoreHeapEntry{record.cached_score, record.last_access_time, checkpoint_id, record.score_version});
+    }
+    score_heap_.swap(fresh);
+}
+
+uint64_t CheckpointLruEvictionPolicy::SelectLowestScoreCheckpoint() {
+    while (!score_heap_.empty()) {
+        const ScoreHeapEntry candidate = score_heap_.top();
+        score_heap_.pop();
+        auto it = checkpoints_.find(candidate.checkpoint_id);
+        if (it == checkpoints_.end() || it->second.score_version != candidate.version) {
             continue;
         }
-        auto checkpoint_it = checkpoints_.find(it->second);
-        if (checkpoint_it != checkpoints_.end()) {
-            return checkpoint_it->second.prefix_blocks;
-        }
+        return candidate.checkpoint_id;
     }
     return 0;
-}
-
-double CheckpointLruEvictionPolicy::CheckpointScore(uint64_t checkpoint_id,
-                                                    const CheckpointRecord &record) const {
-    const size_t fallback_prefix_blocks = EstimateFallbackPrefixBlocks(checkpoint_id, record);
-    const size_t marginal_blocks =
-        std::max<size_t>(1, record.prefix_blocks > fallback_prefix_blocks ? record.prefix_blocks - fallback_prefix_blocks
-                                                                          : 1);
-    const size_t evict_cost_blocks =
-        std::max<size_t>(1, record.mamba_objects.size() + EstimateExclusiveFullBlocks(record));
-    return std::log1p(static_cast<double>(marginal_blocks) / static_cast<double>(evict_cost_blocks)) *
-           record.hotness;
-}
-
-uint64_t CheckpointLruEvictionPolicy::SelectLowestScoreCheckpoint() const {
-    uint64_t selected = 0;
-    double selected_score = std::numeric_limits<double>::infinity();
-    int64_t selected_last_access = std::numeric_limits<int64_t>::max();
-    for (const auto &[checkpoint_id, record] : checkpoints_) {
-        const double score = CheckpointScore(checkpoint_id, record);
-        if (selected == 0 || score < selected_score ||
-            (score == selected_score &&
-             std::tie(record.last_access_time, checkpoint_id) < std::tie(selected_last_access, selected))) {
-            selected = checkpoint_id;
-            selected_score = score;
-            selected_last_access = record.last_access_time;
-        }
-    }
-    return selected;
 }
 
 std::vector<BlockEntry *> CheckpointLruEvictionPolicy::EvictBlocks(size_t count) {
@@ -375,6 +502,10 @@ void CheckpointLruEvictionPolicy::Clear() {
     checkpoints_.clear();
     mamba_to_checkpoint_.clear();
     full_boundary_to_checkpoint_.clear();
+    full_block_checkpoint_xor_.clear();
+    root_checkpoints_.clear();
+    score_heap_ = decltype(score_heap_){};
+    score_base_timestamp_ = -1;
 }
 
 } // namespace kv_cache_manager

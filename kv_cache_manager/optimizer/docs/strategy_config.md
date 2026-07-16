@@ -401,11 +401,7 @@ TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `def
       "eviction_policy_type": "checkpoint_lru",
       "eviction_policy_params": {
         "evict_unreferenced_full_blocks_first": true,
-        "score_alpha": 0.25,
-        "score_min_interval_seconds": 30.0,
-        "score_first_hit_interval_seconds": 399.0,
-        "score_initial_hotness": 0.02,
-        "score_max_hotness": 4.0
+        "score_value_bonus_seconds": 600.0
       }
     }]
   }]
@@ -417,16 +413,16 @@ TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `def
 checkpoint victim 按最低分淘汰：
 
 ```text
-interval_min = max((now - last_hit_time) / 60s, score_min_interval_seconds / 60s)
-instant_hotness = 1 / interval_min
-hotness = min(score_max_hotness, (1 - score_alpha) * old_hotness + score_alpha * instant_hotness)
-
 m = max(1, checkpoint_prefix_blocks - fallback_prefix_blocks)
 c = max(1, mamba_group_objects + exclusive_full_prefix_blocks)
-score = log1p(m / c) * hotness
+has_hit = 0 (尚未命中), 1 (至少命中 1 次)
+value_density = m / (m + c)
+last_access_seconds = (last_access_timestamp - first_checkpoint_timestamp) / 1s
+score = last_access_seconds +
+        score_value_bonus_seconds * has_hit * value_density
 ```
 
-其中 `fallback_prefix_blocks` 是删除该 checkpoint 后能回退到的最近 resident 父 checkpoint 长度；`exclusive_full_prefix_blocks` 是删除该 checkpoint 时实际会释放的独占 full-prefix block 数。`score_first_hit_interval_seconds` 用于第一次命中时初始化瞬时热度，默认 399 秒，对应 qwen3.7 trace 中连续命中间隔约 p95。
+其中 `fallback_prefix_blocks` 是删除该 checkpoint 后能回退到的最近 resident 父 checkpoint 长度；`exclusive_full_prefix_blocks` 是删除该 checkpoint 时实际会释放的独占 full-prefix block 数。`value_density` 使用真实释放成本 `c`，自然落在 `[0, 1)`，同时让尚未发生真实 read hit 的 checkpoint 没有 value bonus，避免一次性长请求仅凭长度长期占用缓存。`score_value_bonus_seconds` 限制 value 最多能提供多少秒的“年轻化”奖励，默认 600 秒；设为 0 时严格退化为 checkpoint LRU。分数只在 register、touch 或 checkpoint 父子/共享引用关系变化时更新并压入 lazy min-heap；淘汰时通过版本号丢弃旧堆项，不再全量扫描所有 checkpoint。堆中的失效项会按比例定期压缩，避免长期回放导致内存持续增长。
 
 当前约束：只支持非分层 `shared` capacity；必须启用 `mamba_state`；不能同时设置 `max_resident_checkpoints`。单个完整 checkpoint 的增量 footprint 大于总容量时，整次 admission 会被拒绝，不会产生部分 Mamba checkpoint。
 
